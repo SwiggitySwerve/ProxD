@@ -87,6 +87,7 @@ type authSelectionEligibility struct {
 	requiredKind     string
 	credentialPolicy string
 	disallowFreeAuth bool
+	serviceTier      string
 }
 
 func withRequiredAuthKind(ctx context.Context, requiredKind string) context.Context {
@@ -106,7 +107,10 @@ func credentialPolicyFromContext(ctx context.Context) string {
 }
 
 func authSelectionEligibilityForRequest(ctx context.Context, opts cliproxyexecutor.Options) authSelectionEligibility {
-	eligibility := authSelectionEligibility{disallowFreeAuth: disallowFreeAuthFromMetadata(opts.Metadata)}
+	eligibility := authSelectionEligibility{
+		disallowFreeAuth: disallowFreeAuthFromMetadata(opts.Metadata),
+		serviceTier:      stringMetadataValue(opts.Metadata, cliproxyexecutor.ServiceTierMetadataKey),
+	}
 	if ctx != nil {
 		eligibility.requiredKind, _ = ctx.Value(requiredAuthKindContextKey{}).(string)
 		eligibility.credentialPolicy, _ = ctx.Value(credentialPolicyContextKey{}).(string)
@@ -116,6 +120,9 @@ func authSelectionEligibilityForRequest(ctx context.Context, opts cliproxyexecut
 
 func (e authSelectionEligibility) allows(auth *Auth) bool {
 	if auth == nil {
+		return false
+	}
+	if ValidateServiceTierAccount(auth, e.serviceTier) != nil {
 		return false
 	}
 	if e.requiredKind != "" && auth.AuthKind() != e.requiredKind {
@@ -985,7 +992,10 @@ func selectionArgForSelector(selector Selector, routeModel string) string {
 func selectorContextForAvailableAuths(ctx context.Context, selector Selector, routeModel string) context.Context {
 	ctx = withWeightedSelectorStateModel(ctx, selector, routeModel)
 	if !isBuiltInSelector(selector) {
-		if _, sessionAffinity := selector.(*SessionAffinitySelector); !sessionAffinity {
+		switch selector.(type) {
+		case *SessionAffinitySelector, *SoonestResetSelector:
+			// Not a scheduler fast path, but it ranks the same validated candidates as fill-first.
+		default:
 			return ctx
 		}
 	}
@@ -1830,7 +1840,7 @@ func (m *Manager) shouldRetryAfterErrorWithAttempted(ctx context.Context, opts c
 	if status == http.StatusOK {
 		return 0, false
 	}
-	if isRequestInvalidError(err) || isRequestStopError(err) || isSchedulerRejectError(err) {
+	if isRequestInvalidError(err) || isRequestStopError(err) || isSchedulerRejectError(err) || isCredentialTerminatedError(err) {
 		return 0, false
 	}
 	if m.HomeEnabled() {
@@ -3278,8 +3288,12 @@ func (m *Manager) warnLogAuthUnavailable(ctx context.Context, providers []string
 
 	coolingSummaries := make([]string, 0)
 	totalCandidates := 0
+	// excluded counts this provider's credentials left out before the cooldown
+	// check, by reason, so a disabled or already-tried credential does not
+	// vanish from an "all candidates are cooling down" warning.
+	excluded := make(map[string]int)
 	for _, candidate := range m.auths {
-		if candidate == nil || candidate.Disabled {
+		if candidate == nil {
 			continue
 		}
 		providerKey := executorKeyFromAuth(candidate)
@@ -3291,18 +3305,25 @@ func (m *Manager) warnLogAuthUnavailable(ctx context.Context, providers []string
 		if _, ok := m.executorLocked(providerKey); !ok {
 			continue
 		}
+		if candidate.Disabled {
+			excluded["disabled"]++
+			continue
+		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
 		if !eligibility.allows(candidate) {
+			excluded["ineligible"]++
 			continue
 		}
 		if tried != nil {
 			if _, used := tried[candidate.ID]; used {
+				excluded["tried"]++
 				continue
 			}
 		}
 		if model != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+			excluded["model_unsupported"]++
 			continue
 		}
 		totalCandidates++
@@ -3314,13 +3335,23 @@ func (m *Manager) warnLogAuthUnavailable(ctx context.Context, providers []string
 	}
 
 	if len(coolingSummaries) > 0 {
+		m.requestQuotaReconcile()
 		sort.Strings(coolingSummaries)
 		entry := logEntryWithRequestID(ctx)
 		providerText := strings.Join(providers, ",")
+		excludedText := ""
+		if len(excluded) > 0 {
+			reasons := make([]string, 0, len(excluded))
+			for reason, count := range excluded {
+				reasons = append(reasons, fmt.Sprintf("%s=%d", reason, count))
+			}
+			sort.Strings(reasons)
+			excludedText = "; excluded before the cooldown check: " + strings.Join(reasons, ", ")
+		}
 		if len(providers) == 1 {
-			entry.Warnf("auth unavailable: %d of %d candidate(s) for model %q (provider=%s) are in cooldown: %s", len(coolingSummaries), totalCandidates, model, providerText, strings.Join(coolingSummaries, ", "))
+			entry.Warnf("auth unavailable: %d of %d candidate(s) for model %q (provider=%s) are in cooldown: %s%s", len(coolingSummaries), totalCandidates, model, providerText, strings.Join(coolingSummaries, ", "), excludedText)
 		} else {
-			entry.Warnf("auth unavailable: %d of %d candidate(s) for model %q (providers=%s) are in cooldown: %s", len(coolingSummaries), totalCandidates, model, providerText, strings.Join(coolingSummaries, ", "))
+			entry.Warnf("auth unavailable: %d of %d candidate(s) for model %q (providers=%s) are in cooldown: %s%s", len(coolingSummaries), totalCandidates, model, providerText, strings.Join(coolingSummaries, ", "), excludedText)
 		}
 	}
 }

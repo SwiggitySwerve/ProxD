@@ -1,4 +1,6 @@
-# CLI Proxy API
+# ProxD
+
+> **ProxD** is this fork's name for CLIProxyAPI. The `main` branch is the deployment branch (PRs target it; until 2026-11-21 it was `local/ultrafast-v8.0.65`) and runs as three services: `proxd-codex` (Codex, port 8317), `proxd-claude` (Claude, port 8319) and `proxd-gemini` (Gemini, port 8321); the host tooling is in [`deploy/local`](deploy/local/README.md). Upstream: [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI).
 
 English | [中文](README_CN.md) | [日本語](README_JA.md)
 
@@ -69,12 +71,12 @@ PackyCode provides special discounts for our software users: register using <a h
 <td>Thanks to APIKEY.FUN for sponsoring this project! APIKEY.FUN is a professional enterprise-grade AI relay platform dedicated to providing stable, efficient, and low-cost AI model API access for enterprises and individual developers. The platform supports popular mainstream models such as Claude, OpenAI, and Gemini, with prices as low as 7% of the official price. Register through this project's <a href="https://apikey.fan/register?aff=CLIProxyAPI">exclusive link</a> to enjoy a special <b>permanent 5% top-up discount</b>.</td>
 </tr>
 <tr>
-<td width="180"><a href="https://api.fenno.ai/s/Cvf0"><img src="./assets/fennoai.png" alt="FennoAI" width="150"></a></td>
-<td>FennoAI is a stable and efficient API relay service provider, currently focused on Codex relay services. It is compatible with OpenAI and Anthropic protocols and can flexibly integrate with mainstream coding tools such as Codex, Claude Code, and OpenCode. It can reliably support enterprise-grade demand of hundreds of billions of tokens per day, with B2B settlement and invoicing available for both domestic and overseas entities. FennoAI offers an exclusive benefit for CLIProxyAPI users: purchase a subscription through the <a href="https://api.fenno.ai/s/Cvf0">exclusive link</a> and receive $50 worth of Coding Plan credits for just $1.99. Referral rewards are also available: earn up to 20% commission when invited friends make a purchase. The more friends you invite, the greater the rewards.</td>
+<td width="180"><a href="https://api.fenno.ai/s/9LRu"><img src="./assets/fennoai.png" alt="Fenno.ai" width="150"></a></td>
+<td>Thanks to <strong>Fenno.ai</strong> for sponsoring this project! Fenno.ai is an API relay service for coding, with a focus on Codex. It brings coding models such as GPT, Claude, and Grok together under one API key, supports both OpenAI and Anthropic protocols, and works directly with popular coding tools such as Codex, Claude Code, Cline, and OpenCode. It supports B2B settlement and invoicing for entities in China and abroad. <strong>New users can <a href="https://api.fenno.ai/s/9LRu">try $50 in credits for $1.99</a>. Earn up to 20% referral commission: the more friends you refer, the more you can earn.</strong></td>
 </tr>
 <tr>
 <td width="180"><a href="https://s.qiniu.com/7zUJri"><img src="./assets/qiniucloud.png" alt="Qiniu Cloud AI" width="150"></a></td>
-<td>Thanks to <a href="https://s.qiniu.com/7zUJri">Qiniu Cloud AI</a> for sponsoring this project! Qiniu Cloud AI is an enterprise-grade large-model MaaS platform under Qiniu Cloud (02567.HK). It provides one-stop access to 150+ mainstream global models, is compatible with protocols from major global model providers, and covers full-modal processing capabilities for text, image, audio, video, and files. It serves more than 1.69 million enterprise and developer users. Exclusive benefits: enterprise users can claim 12 million free tokens, and invite friends to earn up to tens of billions of tokens.</td>
+<td>Thanks to <strong>Qiniu Cloud</strong> for sponsoring this project! Qiniu Cloud (02567.HK) operates an enterprise-grade MaaS platform that provides one-stop access to 150+ leading global models. It supports protocols from major model providers and processes text, images, audio, video, and files, serving more than 1.8 million enterprise developers. <strong>New enterprise users can claim 20 million free tokens. As part of the year-end promotion, new users can <a href="https://www.qiniu.com/ai/free-models/conatus-2026?utm_source=CLIProxyAPI&amp;utm_medium=oss&amp;utm_campaign=comatus_202611&amp;utm_content=readme">get up to 1 billion free tokens per day</a>.</strong></td>
 </tr>
 <tr>
 <td width="180"><a href="https://cubence.com/signup?code=CLIPROXYAPI&source=cpa"><img src="./assets/cubence.png" alt="Cubence" width="150"></a></td>
@@ -167,9 +169,9 @@ Since v6.10.0, CLIProxyAPI and [CPAMC](https://github.com/router-for-me/Cli-Prox
 
 Standalone persistence and visualization service for CLIProxyAPI, with periodic data sync, SQLite storage, aggregate APIs, and a built-in dashboard for usage and statistics.
 
-### [CPA-Manager-Plus](https://github.com/seakee/CPA-Manager-Plus)
+### prox-usage
 
-A self-hosted CLIProxyAPI management console and observability dashboard, available as a lightweight drop-in panel or a full Manager Server with persistent analytics. Manage OAuth credentials, AI providers, client API keys, model aliases, plugins, and CPA settings in one interface. SQLite-backed request history enables live monitoring, failure diagnosis, and token, latency, and estimated-cost breakdowns by model, provider, account, key, and channel. Supports editable model prices and one-click price sync, alongside Codex and xAI quota checks, reset information, account-health inspection, and controlled recovery actions. Deploy via Docker or cross-platform native packages, with data stored locally.
+This deployment's usage source: the Prox usage service stores request events and serves canonical lifetime usage totals at `GET /v1/exporter` (bearer-protected, loopback), which the local Prometheus exporter in `deploy/local/sidecars/exporter/` reads. See that directory's README.
 
 ### [Oh-My-CPA](https://github.com/WizisCool/oh-my-cpa)
 

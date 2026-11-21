@@ -276,6 +276,9 @@ func (m *Manager) clientModelProjectionForAuth(auth *Auth, routeModel string, no
 			isQuotaExceeded = true
 		}
 	}
+	if credQuotaSuspended {
+		isQuotaExceeded = true
+	}
 
 	var authFallbackUntil time.Time
 	if len(auth.ModelStates) == 0 {
@@ -304,16 +307,18 @@ func (m *Manager) clientModelProjectionForAuth(auth *Auth, routeModel string, no
 			if suspendReason == "" {
 				suspendReason = "unauthorized"
 			}
-		case stateSuspended:
+		case stateSuspended && !credQuotaSuspended:
 			suspendReason = cooldownReason(state.StatusMessage, state.Quota, state.LastError)
 			suspendUntil = stateUntil
-			if credQuotaSuspended && (strings.EqualFold(suspendReason, "quota") || strings.EqualFold(suspendReason, "credential_quota")) && credQuotaUntil.After(suspendUntil) {
-				suspendUntil = credQuotaUntil
-			}
 		default:
+			// A credential quota suspends every model; a model's own longer
+			// block only extends the deadline, as the availability gate does.
 			suspendUntil = authFallbackUntil
 			if credQuotaUntil.After(suspendUntil) {
 				suspendUntil = credQuotaUntil
+			}
+			if stateUntil.After(suspendUntil) {
+				suspendUntil = stateUntil
 			}
 		}
 		if suspendReason == "" {
@@ -381,6 +386,26 @@ func (m *Manager) filterExecutionModelsForRequest(ctx context.Context, auth *Aut
 		out = append(out, upstreamModel)
 	}
 	return out
+}
+
+// blockedExecutionModelsError explains why a selected credential has no
+// executable upstream model left after filtering. The attempt loop marks the
+// credential tried, so it records this error instead of skipping silently.
+func (m *Manager) blockedExecutionModelsError(ctx context.Context, auth *Auth, routeModel string, candidates []string, pooled bool, clientHeaders ...http.Header) error {
+	now := time.Now()
+	var earliest time.Time
+	var cause error
+	for _, upstreamModel := range candidates {
+		stateModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
+		_, _, next := isAuthBlockedForModelForRequest(ctx, auth, stateModel, now, clientHeaders...)
+		if next.After(now) && (earliest.IsZero() || next.Before(earliest)) {
+			earliest = next
+		}
+		if cause == nil {
+			cause = latestCandidateErrorForModel([]*Auth{auth}, func(*Auth) string { return stateModel })
+		}
+	}
+	return newAuthUnavailableErrorWithCause(earliest, now, cause)
 }
 
 func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string) ([]string, bool) {

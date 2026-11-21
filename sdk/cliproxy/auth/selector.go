@@ -122,7 +122,7 @@ func newModelCooldownError(model, provider string, resetIn time.Duration) *model
 }
 
 func newModelCooldownErrorWithCause(model, provider string, resetIn time.Duration, cause error) *modelCooldownError {
-	return newModelCooldownErrorForCandidates(model, provider, resetIn, cause, isClaudeCooldownProvider(provider), nil)
+	return newModelCooldownErrorForCandidates(model, provider, resetIn, cause, providerPinsCooldownSignals(provider), nil)
 }
 
 func newModelCooldownErrorForCandidates(model, provider string, resetIn time.Duration, cause error, claudeCooldown bool, claudeSignals map[string]string) *modelCooldownError {
@@ -137,10 +137,6 @@ func newModelCooldownErrorForCandidates(model, provider string, resetIn time.Dur
 		claudeCooldown: claudeCooldown,
 		claudeSignals:  maps.Clone(claudeSignals),
 	}
-}
-
-func isClaudeCooldownProvider(provider string) bool {
-	return strings.EqualFold(strings.TrimSpace(provider), "claude")
 }
 
 func (e *modelCooldownError) IsModelCooldown() bool {
@@ -683,22 +679,21 @@ func claudeSignalsFromEvaluatedQuota(q QuotaState) (bool, map[string]string) {
 }
 
 func claudeUnifiedCooldownForAuth(auth *Auth, model string, now time.Time) (bool, map[string]string) {
-	if auth == nil || executorKeyFromAuth(auth) != "claude" {
+	if auth == nil || !providerPinsCooldownSignals(executorKeyFromAuth(auth)) {
 		return false, nil
 	}
 	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
 		state := existingModelState(auth, model)
 		if state != nil && state.NextRetryAfter.After(auth.Quota.NextRecoverAt) {
-			if shadow := state.credentialQuotaShadow; shadow != nil {
-				if !shadow.Quota.Exceeded || !shadow.Quota.NextRecoverAt.After(now) || shadow.NextRetryAfter.After(shadow.Quota.NextRecoverAt) {
-					return false, nil
-				}
-				if strings.EqualFold(strings.TrimSpace(shadow.Quota.Reason), "cloudflare challenge") {
-					return false, nil
-				}
-				return claudeSignalsFromEvaluatedQuota(shadow.Quota)
+			// The model's own block outlasts the credential quota, so the
+			// headers describe that block.
+			if !state.Quota.Exceeded || !state.Quota.NextRecoverAt.After(now) || state.NextRetryAfter.After(state.Quota.NextRecoverAt) {
+				return false, nil
 			}
-			return false, nil
+			if strings.EqualFold(strings.TrimSpace(state.Quota.Reason), "cloudflare challenge") {
+				return false, nil
+			}
+			return claudeSignalsFromEvaluatedQuota(state.Quota)
 		}
 		if ok, signals := claudeSignalsFromEvaluatedQuota(auth.Quota); ok {
 			return true, signals
@@ -725,9 +720,6 @@ func claudeUnifiedCooldownForAuth(auth *Auth, model string, now time.Time) (bool
 			found := false
 			for _, key := range keys {
 				st := auth.ModelStates[key]
-				if st != nil && (st.credentialQuotaPropagated || st.Quota.Reason == "credential_quota") {
-					st = st.credentialQuotaShadow
-				}
 				if st == nil || !st.Quota.Exceeded || !st.Quota.NextRecoverAt.After(now) || st.NextRetryAfter.After(st.Quota.NextRecoverAt) {
 					return false, nil
 				}
@@ -747,9 +739,6 @@ func claudeUnifiedCooldownForAuth(auth *Auth, model string, now time.Time) (bool
 			return found, earliestSignals
 		}
 		state := existingModelState(auth, model)
-		if state != nil && (state.credentialQuotaPropagated || state.Quota.Reason == "credential_quota") {
-			state = state.credentialQuotaShadow
-		}
 		if state == nil || !state.Quota.Exceeded || !state.Quota.NextRecoverAt.After(now) || state.NextRetryAfter.After(state.Quota.NextRecoverAt) {
 			return false, nil
 		}
@@ -1252,7 +1241,11 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	return isAuthBlockedForModelForRequest(nil, auth, model, now)
 }
 
-func isAuthBlockedForModelForRequest(ctx context.Context, auth *Auth, model string, now time.Time, clientHeaders ...http.Header) (bool, blockReason, time.Time) {
+// credentialAvailabilityBlock is the credential-wide part of the availability
+// predicate: the gates that block every model whatever its own state says.
+// model only extends a credential quota's deadline with that model's own
+// longer cooldown.
+func credentialAvailabilityBlock(ctx context.Context, auth *Auth, model string, now time.Time, clientHeaders ...http.Header) (bool, blockReason, time.Time) {
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}
@@ -1327,6 +1320,17 @@ func isAuthBlockedForModelForRequest(ctx context.Context, auth *Auth, model stri
 			}
 		}
 		return true, blockReasonOther, credNext
+	}
+	return false, blockReasonNone, time.Time{}
+}
+
+// isAuthBlockedForModelForRequest is the availability predicate. Selection, the
+// scheduler's model shards, the all-cooled warning and the scheduler's
+// credential-wide resync check (isCredentialBlocked) all read it, so they agree
+// on which credentials can serve model.
+func isAuthBlockedForModelForRequest(ctx context.Context, auth *Auth, model string, now time.Time, clientHeaders ...http.Header) (bool, blockReason, time.Time) {
+	if blocked, reason, next := credentialAvailabilityBlock(ctx, auth, model, now, clientHeaders...); blocked {
+		return true, reason, next
 	}
 	unavailable := codexRefreshUnavailableForRequest(ctx, auth, now, clientHeaders...)
 	if model != "" {
@@ -1472,60 +1476,41 @@ func isAuthBlockedByQuotaOrAuthForModel(auth *Auth, model string, now time.Time)
 	return isAuthBlockedByQuotaOrAuthForModelForRequest(nil, auth, model, now)
 }
 
+// isAuthBlockedByQuotaOrAuthForModelForRequest is the session-affinity rebind
+// check for rebind-on quota and never. It derives from the availability
+// predicate: a credential that predicate blocks for a quota cooldown, for being
+// disabled, or with no recovery time cannot serve model now, so the session
+// rebinds. What remains is the rebind-on policy: a transient cooldown keeps the
+// binding unless the failure recorded for model is rebind-worthy (quota, auth,
+// model support). The same failure rule applies to a credential the predicate
+// still picks: the check only runs for a bound credential selection left out,
+// so a pickable one was tried in this request and just failed (with cooling
+// disabled a 429 leaves it pickable, and the session should still move).
 func isAuthBlockedByQuotaOrAuthForModelForRequest(ctx context.Context, auth *Auth, model string, now time.Time, clientHeaders ...http.Header) bool {
-	if auth == nil {
+	blocked, reason, next := isAuthBlockedForModelForRequest(ctx, auth, model, now, clientHeaders...)
+	if blocked && (reason != blockReasonOther || next.IsZero()) {
 		return true
 	}
-	if auth.Disabled || auth.Status == StatusDisabled {
-		return true
-	}
-	if codexRefreshMissingAccessForRequest(ctx, auth, clientHeaders...) {
-		return true
-	}
-	if hasUnauthorizedAuthFailure(auth) {
-		return true
-	}
-	if exp, ok := auth.AccessTokenExpirationTimeForRequest(ctx, clientHeaders...); ok && !exp.IsZero() && !exp.After(now) {
-		return true
-	}
-	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && (auth.Quota.NextRecoverAt.IsZero() || auth.Quota.NextRecoverAt.After(now)) {
-		return true
-	}
+	return hasRebindWorthyFailureForModel(auth, model)
+}
+
+// hasRebindWorthyFailureForModel reports whether the failure recorded for model
+// (its model state when the credential tracks one, else the credential) is one
+// rebind-on quota rebinds on.
+func hasRebindWorthyFailureForModel(auth *Auth, model string) bool {
 	if model != "" && len(auth.ModelStates) > 0 {
 		modelKey := canonicalModelLookupKey(model)
 		for stateModel, state := range auth.ModelStates {
 			if state == nil || canonicalModelLookupKey(stateModel) != modelKey {
 				continue
 			}
-			if state.Status == StatusDisabled {
-				return true
-			}
-			if isStateBlockedByQuotaOrAuth(state.Unavailable, state.Quota, state.NextRetryAfter, state.LastError, now) {
+			if shouldRebindSessionAffinityOnError(state.LastError) {
 				return true
 			}
 		}
 		return false
 	}
-	quota := auth.Quota
-	unavailable := codexRefreshUnavailableForRequest(ctx, auth, now, clientHeaders...)
-	if len(auth.ModelStates) > 0 && auth.Quota.Reason != "credential_quota" && !unavailable {
-		quota.Exceeded = false
-	}
-	return isStateBlockedByQuotaOrAuth(unavailable, quota, auth.NextRetryAfter, auth.LastError, now)
-}
-
-func isStateBlockedByQuotaOrAuth(unavailable bool, quota QuotaState, nextRetryAfter time.Time, lastErr *Error, now time.Time) bool {
-	if quota.Exceeded && (quota.NextRecoverAt.IsZero() || quota.NextRecoverAt.After(now)) {
-		return true
-	}
-	blocked, _, _ := availabilityBlock(unavailable, quota.Exceeded, nextRetryAfter, quota.NextRecoverAt, now)
-	if !blocked {
-		return lastErr != nil && shouldRebindSessionAffinityOnError(lastErr)
-	}
-	if lastErr != nil {
-		return shouldRebindSessionAffinityOnError(lastErr)
-	}
-	return nextRetryAfter.IsZero() && quota.NextRecoverAt.IsZero()
+	return shouldRebindSessionAffinityOnError(auth.LastError)
 }
 
 func (s *SessionAffinitySelector) shouldPreserveBindingWhenUnavailable(ctx context.Context, candidates []*Auth, model, authID string, now time.Time) bool {

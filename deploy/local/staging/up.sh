@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# up.sh [git-ref|worktree]: build the proxy image from a git ref (or the current
+# worktree, the default) and start the staging pod: proxy + mock upstream.
+# Idempotent: re-running rebuilds if needed and recreates the two containers.
+# STAGING_NAME=<name> runs a separate stack (see lib.sh). A concurrent up.sh for the
+# same name is refused, and so is a pod owned by a different data dir or ports.
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/$POD.lock"
+flock -n 9 || die "another up.sh for staging '${NAME:-default}' is running; use a distinct STAGING_NAME"
+if pod_exists "$POD"; then guard_pod_owner; fi
+
+SRC=${1:-worktree}
+DIRTY=""
+if [ "$SRC" = worktree ]; then
+  SHA=$(git -C "$REPO_ROOT" rev-parse --short=8 HEAD)
+  [ -z "$(git -C "$REPO_ROOT" status --porcelain)" ] || DIRTY="-dirty"
+else
+  SHA=$(git -C "$REPO_ROOT" rev-parse --verify --short=8 "$SRC^{commit}") || die "unknown git ref '$SRC'"
+fi
+IMAGE="$IMAGE_REPO:staging-$SHA$DIRTY"
+
+if [ -z "$DIRTY" ] && podman image exists "$IMAGE"; then
+  echo "image $IMAGE already built"
+else
+  echo "building $IMAGE from $SRC"
+  VERSION=staging "$STAGING_DIR/../bin/build-image.sh" "$SRC" "$IMAGE" 9>&-
+fi
+
+render_config
+ensure_pod
+start_mock
+start_proxy "$IMAGE"
+wait_http "$(mock_url)/healthz" 30 || die "mock did not become healthy (deploy/local/staging/logs.sh mock)"
+wait_http "$(proxy_url)/healthz" 60 || die "proxy did not become healthy (deploy/local/staging/logs.sh)"
+
+echo "staging up: image=$IMAGE"
+echo "  proxy  $(proxy_url)   (client and management keys under $DATA_DIR)"
+echo "  mock   $(mock_url)   (admin: /admin/scenario, /admin/log)"

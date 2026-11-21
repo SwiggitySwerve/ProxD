@@ -175,8 +175,17 @@ access:
 
 # Routing strategy for selecting credentials when multiple match.
 routing:
-  strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first
+  strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first, soonest-reset
+  # Local patch (see LOCAL-PATCH.md): credentials allowed to serve service_tier=ultrafast.
+  # A Codex credential is allowed when it matches any entry below. Leaving this unset (or all
+  # lists empty) denies ultrafast for every credential: requests get a 403 and never fall back.
+  # ultrafast:
+  #   account-ids: ["<codex-account-id>"] # preferred: "account_id" in the Codex auth file
+  #   auth-ids: ["<auth-file-name>.json"] # the credential id (auth file name)
+  #   emails: ["<account-email>"] # fallback only; email is not unique across providers
   # weighted-round-robin uses each credential's integer weight (default 1, maximum 1,000,000).
+  # soonest-reset prefers the credential whose longest quota window resets soonest, read from the
+  # quota headers of earlier responses; credentials without an observation are tried first.
   # Non-positive weights exclude the credential while this strategy is active.
   # Sticky requests (including inherited and LCP bindings) also consume weighted credits
   # without moving existing bindings. Compensation is scoped to each eligible credential set;
@@ -263,6 +272,29 @@ routing:
     # When true, persist per-auth cooldown status as .cds files next to auth files.
     # Default is false; when false, cooldown status is kept in memory only.
     save-cooldown-status: false
+
+    # Recheck credentials that hold a quota cooldown against the provider and, in clear mode, clear the
+    # cooldown once the provider says usage is allowed again. Accepts a bool or a per-provider map.
+    #   true  = codex in clear mode (checked every pass, at least 10s apart, and when a request is
+    #           rejected by a cooldown; sends one read-only usage request per cooled-down credential)
+    #   false = off
+    # Map form, one entry per provider (only providers with a recheck adapter are checked; today: codex):
+    #   mode: off | observe | clear. observe logs the verdict (provider, credential id, verdict, signals)
+    #     and never clears; clear also clears the cooldown. Required.
+    #   interval: gap between rechecks of a cooled credential (default codex 10s, others 30m; minimum 10s).
+    #   near-reset-interval: gap used within near-reset-window before a known reset (default codex 10s, others 5m).
+    #   near-reset-window: how long before a known reset the near interval applies (default codex 0, others 1h).
+    # After the loop clears a cooldown, a quota 429 within 10 minutes doubles that credential's
+    # interval (up to 6h) until its known reset passes.
+    # When every candidate for a request is cooled, one recheck round runs before the 429 (at most
+    # once per credential per 60s): claude sends the request itself on a cooled credential and a 200
+    # with an allowed unified status clears the cooldown in clear mode (observe serves it but keeps
+    # the cooldown); codex asks its usage endpoint and then selects again.
+    # Example:
+    #   quota-reconcile:
+    #     codex: {mode: clear}
+    #     claude: {mode: observe, interval: 30m, near-reset-interval: 5m, near-reset-window: 1h}
+    quota-reconcile: false
 
     # Cooldown duration in seconds for transient upstream errors (408/500/502/503/504/520-526).
     # Set to 0 to keep the legacy 60-second cooldown; set to -1 to disable transient error cooldowns.
@@ -356,20 +388,45 @@ requests:
   #           protocol: "codex" # restricts the rule to a specific protocol, options: openai, gemini, claude, codex, antigravity, meta
   #       params: # JSON path (gjson/sjson syntax) -> raw JSON value (strings are used as-is, must be valid JSON)
   #         "response_format": "{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"answer\",\"schema\":{\"type\":\"object\"}}}"
-  #   replace: # Ordered literal replacements in existing user text; runs after overrides, before filter.
-  #     - models: # Same model, protocol, header, and payload conditions as other rules.
+  #   replace: # Ordered literal and Go RE2 regex replacements in existing strings; runs after overrides, before filter.
+  #     - models:
   #         - name: "*"
   #           protocol: "claude"
   #           from-protocol: "openai"
   #       target:
-  #         role: user
-  #         positions: [1, 2] # One-based user positions in the final upstream body; missing positions are skipped.
-  #         # all: true      # Select every user instead of positions (mutually exclusive).
-  #       replacements: # Each entry has exactly one non-empty string key and a string value.
+  #         role: user # system, developer, or user
+  #         positions: [1, 2] # One-based positions of the selected role in the final upstream body; missing positions are skipped.
+  #         # all: true      # Select all messages of this role instead of positions (mutually exclusive).
+  #       replacements: # Each entry is either {"source": "destination"} (literal) or {pattern, replacement} (Go RE2 regex; $1/${1} expand captures).
   #         - "you are hero": "you are fool"
   #         - "remove this phrase": ""
-  #       # Text blocks are processed separately; images, tools, and thinking are not modified.
+  #         - pattern: '(?i)\bhero\b'
+  #           replacement: "friend"
+  #         - pattern: '(?s)<debug>.*?</debug>'
+  #           replacement: ""
+  #       # Invalid regex entries are skipped with an index-only warning; other replacements still run.
+  #       # Role targets process text blocks separately; assistant replies, images, tools, and thinking are not modified.
   #       # Supported layouts: OpenAI Chat, Claude, Responses/Codex, Gemini, and Antigravity.
+  #       # system includes Claude system, Gemini systemInstruction, and Responses instructions (each counts as one message, before any system messages).
+  #       # developer merged into system during translation must be selected as system.
+  #       # Matching uses final upstream roles, not the original client roles.
+  #     - models:
+  #         - name: "*"
+  #           protocol: "codex"
+  #       target:
+  #         paths: # Alternative to role/positions/all (mutually exclusive); paths are relative to the provider payload root.
+  #           - 'tools.#(type=="function")#.description'
+  #           - "metadata.description"
+  #       replacements: # Same ordered literal and Go RE2 regex rules as role targets; $1/${1} expand captures.
+  #         - "old name": "new name"
+  #         - "remove this phrase": ""
+  #         - pattern: '(?i)user-(\d+)'
+  #           replacement: 'account-${1}'
+  #         - pattern: '(?s)<debug>.*?</debug>'
+  #           replacement: ""
+  #       # Invalid regex entries are skipped with an index-only warning; other replacements still run.
+  #       # Path targets edit only existing string nodes, regardless of role or field; missing/non-string nodes are skipped.
+  #       # Objects/arrays are not traversed recursively; duplicate resolved paths are replaced once per rule.
   #   filter: # Filter rules remove specified parameters from the payload.
   #     - models:
   #         - name: "gemini-2.5-pro" # Supports wildcards (e.g., "gemini-*")
@@ -1196,6 +1253,12 @@ oauth:
     aistudio:
       # When true, enable authentication for the WebSocket API (/v1/ws).
       ws-auth: true
+
+    # Claude OAuth login behavior.
+    # claude:
+    #   # Include the org:create_api_key scope during new Claude OAuth logins (default: true).
+    #   # Set to false to request only the five user:* scopes (note: claude.ai may require org:create_api_key).
+    #   oauth-include-create-api-key: true
 
     # Codex provider behavior.
     codex:

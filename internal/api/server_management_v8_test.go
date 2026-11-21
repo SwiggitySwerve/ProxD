@@ -17,8 +17,42 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
+
+func TestManagementV8UsageReplayRoute(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
+	previous := redisqueue.Enabled()
+	redisqueue.SetEnabled(false)
+	t.Cleanup(func() {
+		redisqueue.SetEnabled(false)
+		redisqueue.SetEnabled(previous)
+	})
+	server := newTestServer(t)
+	redisqueue.Enqueue([]byte(`{"id":1}`))
+	for _, authorized := range []bool{false, true} {
+		req := httptest.NewRequest(http.MethodGet, "/v8/management/observability/usage/queue?after_seq=0", nil)
+		if authorized {
+			req.Header.Set("Authorization", "Bearer test-management-key")
+		}
+		rec := httptest.NewRecorder()
+		server.engine.ServeHTTP(rec, req)
+		if !authorized {
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("unauthenticated status = %d", rec.Code)
+			}
+			continue
+		}
+		page := ojson.ParseBytes(rec.Body.Bytes())
+		if rec.Code != 200 || page.Get("boot_id").String() == "" || len(page.Get("records").Array()) != 1 || page.Get("records.0.queue_seq").Uint() == 0 {
+			t.Fatalf("replay route: status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	}
+	if len(redisqueue.PopOldest(10)) != 1 {
+		t.Fatal("replay route consumed queued record")
+	}
+}
 
 func TestManagementV8RoutesShareAccessControl(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -48,7 +82,7 @@ func TestManagementV8RoutesShareAccessControl(t *testing.T) {
 			s := &Server{cfg: cfg, engine: gin.New(), mgmt: h}
 			s.managementRoutesEnabled.Store(tc.enabled)
 			s.registerManagementRoutes()
-			for _, route := range []string{"/v0/management/config", "/v8/management/config", "/v0/management/plugins", "/v8/management/plugins"} {
+			for _, route := range []string{"/v0/management/config", "/v8/management/config", "/v0/management/plugins", "/v8/management/plugins", "/v8/management/providers", "/v8/management/quota/providers"} {
 				req := httptest.NewRequest(http.MethodGet, route, nil)
 				req.RemoteAddr = "127.0.0.1:1234"
 				if tc.authorized {
@@ -93,6 +127,7 @@ func TestManagementV8IndependentContract(t *testing.T) {
 		"GET /v8/management/observability/logs", "GET /v8/management/observability/usage/queue",
 		"GET /v8/management/credentials", "POST /v8/management/credentials", "POST /v8/management/credentials/verify",
 		"GET /v8/management/oauth/auth-url", "POST /v8/management/oauth/auth-url", "POST /v8/management/oauth/import", "POST /v8/management/oauth/callback",
+		"GET /v8/management/providers", "GET /v8/management/quota/providers", "POST /v8/management/quota/fetch",
 		"POST /v8/management/routing/cooldown/reset",
 		"POST /v8/management/routing/model-definitions/refresh",
 		"POST /v8/management/models/refresh",

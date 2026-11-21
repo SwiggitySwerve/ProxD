@@ -14,16 +14,21 @@ import (
 )
 
 func init() {
-	coreusage.RegisterPlugin(&usageQueuePlugin{})
+	coreusage.RegisterPlugin(&usageQueuePlugin{instanceID: DeploymentInstanceID()})
 }
 
-type usageQueuePlugin struct{}
+type usageQueuePlugin struct{ instanceID string }
 
 func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Record) {
 	if p == nil {
 		return
 	}
-	if !Enabled() || !UsageStatisticsEnabled() {
+	selectionID := strings.TrimSpace(record.SelectionID)
+	if selectionID == "" {
+		selectionID = coreusage.SelectionIDFromContext(ctx)
+	}
+	// Home scheduler completion feedback is needed even when local statistics are disabled.
+	if !Enabled() || (!UsageStatisticsEnabled() && (selectionID == "" || record.HomeSelection == nil)) {
 		return
 	}
 
@@ -162,11 +167,28 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		ResponseHeaders:  record.ResponseHeaders,
 	}
 
+	recordKind := record.RecordKind
+	if recordKind == "" {
+		recordKind = coreusage.RecordUnknown
+	}
+	timingMethod := record.TTFTMethod
+	if timingMethod == "" {
+		timingMethod = coreusage.TimingUnavailable
+	}
 	payload, err := json.Marshal(queuedUsageDetail{
+		InstanceID:            p.instanceID,
+		UsagePresence:         usageDetail.UsageFields.Presence(),
+		UsageFields:           usageDetail.UsageFields,
+		TTFTMethod:            timingMethod,
+		Timing:                record.Timing,
+		RecordKind:            recordKind,
+		ParentExecutionID:     record.ParentExecutionID,
 		requestDetail:         detail,
 		AccountingVersion:     coreusage.TokenAccountingSchemaVersion,
 		TokenBreakdown:        usageDetail.TokenBreakdown,
 		Provider:              provider,
+		BaseURL:               record.BaseURL,
+		AuthID:                record.AuthID,
 		ExecutorType:          executorType,
 		Model:                 modelName,
 		Alias:                 aliasName,
@@ -177,6 +199,7 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		AccessProvider:        accessProvider,
 		RequestID:             requestID,
 		ExecutionID:           executionID,
+		SelectionID:           selectionID,
 		HomeSelection:         record.HomeSelection,
 		TraceID:               traceID,
 		SessionID:             sessionID,
@@ -209,10 +232,19 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 }
 
 type queuedUsageDetail struct {
+	InstanceID        string                      `json:"instance_id,omitempty"`
+	UsagePresence     string                      `json:"usage_presence"`
+	UsageFields       *coreusage.TokenUsageFields `json:"usage_fields"`
+	TTFTMethod        coreusage.TimingMethod      `json:"ttft_method"`
+	Timing            *coreusage.ExecutionTiming  `json:"timing"`
+	RecordKind        coreusage.RecordKind        `json:"record_kind"`
+	ParentExecutionID string                      `json:"parent_execution_id"`
 	requestDetail
 	AccountingVersion     int                         `json:"accounting_version"`
 	TokenBreakdown        coreusage.TokenBreakdown    `json:"token_breakdown"`
 	Provider              string                      `json:"provider"`
+	BaseURL               string                      `json:"base_url,omitempty"`
+	AuthID                string                      `json:"auth_id,omitempty"`
 	ExecutorType          string                      `json:"executor_type"`
 	Model                 string                      `json:"model"`
 	Alias                 string                      `json:"alias"`
@@ -223,6 +255,7 @@ type queuedUsageDetail struct {
 	AccessProvider        string                      `json:"access_provider,omitempty"`
 	RequestID             string                      `json:"request_id"`
 	ExecutionID           string                      `json:"execution_id,omitempty"`
+	SelectionID           string                      `json:"selection_id,omitempty"`
 	HomeSelection         *coreusage.HomeSelection    `json:"home_selection,omitempty"`
 	TraceID               string                      `json:"trace_id,omitempty"`
 	SessionID             string                      `json:"session_id,omitempty"`

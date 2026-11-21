@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+"""Prometheus exporter for the ProxD subscription proxy.
+
+Everything is computed at scrape time from local sources, read-only:
+  - prox-usage GET /v1/exporter: canonical lifetime usage at the same current rates
+    as Prox analytics, with source="prox-usage-2" (bumped from "prox-usage" for a price decrease) and the existing label values.
+  - prox-usage source subscription and event age: additive health without a source label.
+  - ProxD management API (GET /credentials on each instance): the proxy's own
+    state per credential (available / cooling / unavailable / disabled, next_retry_after,
+    per-model cooldowns, quota signals and their age), labelled by instance and auth_index.
+    This is the source of truth for availability.
+  - proxd-rerank state (~/.local/share/proxd/rerank/state.json): ADVISORY weekly
+    quota used %, reset time, limited flag and soonest-reset rank per account, with its age.
+  - Liveness of the proxy instances (/healthz); the usage service's liveness is its own health series.
+
+Serves /metrics on 127.0.0.1 and the cluster bridge address so the in-cluster
+Prometheus can scrape it. Labels hold account emails; this endpoint is only
+reachable from the host and the cluster.
+
+Every metric is named proxd_*. Before the ProxD rename they were cliproxy_*; the exporter
+published both prefixes while dashboards and alerts moved over, and now publishes proxd_* only.
+"""
+import json
+import math
+import os
+import re
+import sys
+import threading
+import time
+import urllib.request
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+HOME = Path.home()
+
+
+def env(name):
+    """PROXD_<name>, else the pre-rename CLI_PROXY_<name>; None when neither is set."""
+    return os.environ.get(f"PROXD_{name}") or os.environ.get(f"CLI_PROXY_{name}")
+
+
+STATE = Path(env("RERANK_STATE") or HOME / ".local/share/proxd/rerank/state.json")
+PLANS = Path(env("PLANS") or HOME / ".config/proxd/plans.json")
+MGMT_KEY = Path(env("MANAGEMENT_KEY_FILE") or HOME / ".config/proxd/management-key").read_text().strip()
+# Proxy instances come from the shared instance map (deploy/local/instances.example.json);
+# the built-in values apply when the file is missing.
+INSTANCES_FILE = Path(env("INSTANCES") or HOME / ".config/proxd/instances.json")
+BUILTIN_INSTANCES = [
+    {"id": "claude-primary", "provider": "claude", "base_url": "http://127.0.0.1:8319", "management_path": "/v8/management"},
+    {"id": "codex-primary", "provider": "codex", "base_url": "http://127.0.0.1:8317", "management_path": "/v8/management"},
+]
+# Listen addresses are host-specific and stay out of the repo: ~/.config/proxd/exporter.json
+# {"listen": [["127.0.0.1", 9787], ["<bridge-address>", 9787]]}. PROXD_EXPORTER_LISTEN
+# ("host:port,host:port") overrides the file; loopback only when neither is set.
+EXPORTER_FILE = Path(env("EXPORTER_CONFIG") or HOME / ".config/proxd/exporter.json")
+USAGE = "http://127.0.0.1:18320"
+USAGE_SOURCE = "prox-usage-2"  # Bumped 2026-11-16 for the Sonnet 5.5 cache-read decrease; bump again on any later counter-decreasing price change.
+USAGE_DEADLINE_SECONDS = 4
+_usage_http_gate = threading.Semaphore(1)
+# Anthropic reports some limits under internal codenames; same labels as the dashboard.
+CLAUDE_WINDOW_NAMES = {"iguana_necktie": "Fable weekly", "seven_day": "Weekly", "five_hour": "5-hour"}
+
+
+def load_proxies():
+    """Instance map as {label: (base URL, management URL, instance id)}; the label is the provider name."""
+    try:
+        instances = json.loads(INSTANCES_FILE.read_text())["instances"]
+    except FileNotFoundError:
+        instances = BUILTIN_INSTANCES
+    proxies = {}
+    for i in instances:
+        base = i["base_url"].rstrip("/")
+        proxies[i["provider"] if i["provider"] not in proxies else i["id"]] = (
+            base, base + i.get("management_path", "/v8/management"), i["id"])
+    return proxies
+
+
+def load_listen():
+    spec = env("EXPORTER_LISTEN")
+    if spec:
+        return [(h, int(p)) for h, _, p in (s.strip().rpartition(":") for s in spec.split(","))]
+    try:
+        return [(h, int(p)) for h, p in json.loads(EXPORTER_FILE.read_text())["listen"]]
+    except FileNotFoundError:
+        return [("127.0.0.1", 9787)]
+
+
+PROXIES = load_proxies()
+LISTEN = load_listen()
+
+
+def esc(value) -> str:
+    return str(value if value not in (None, "") else "unknown").replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+
+
+class Metrics:
+    def __init__(self):
+        self.lines = []  # "# HELP/TYPE" strings, or [series, value] pairs
+        self.series = {}  # series -> its [series, value] pair, so repeats are summed
+        self.declared = set()
+        self.now = time.time()  # one clock for the whole scrape
+        self.usage_response = None  # at most one bounded Prox request per scrape
+        self.creds = None  # GET /credentials result, fetched once per scrape
+
+    def add(self, name, kind, help_text, value, /, **labels):  # positional-only: a label may be called kind
+        if name not in self.declared:
+            self.lines.append(f"# HELP {name} {help_text}")
+            self.lines.append(f"# TYPE {name} {kind}")
+            self.declared.add(name)
+        lab = ",".join(f'{k}="{esc(v)}"' for k, v in labels.items())
+        series = f"{name}{{{lab}}}" if lab else name
+        if series in self.series:
+            self.series[series][1] += float(value)
+        else:
+            self.series[series] = [series, float(value)]
+            self.lines.append(self.series[series])
+
+    def text(self):
+        # Full precision: counters reach 1e9+ tokens, and 6 significant digits hid small increments.
+        out = [l if isinstance(l, str) else f"{l[0]} {'NaN' if math.isnan(l[1]) else format(l[1], '.17g')}" for l in self.lines]
+        return "\n".join(out) + "\n"
+
+
+def http_ok(url, headers=None, timeout=5):
+    try:
+        req = urllib.request.Request(url, headers=headers or {})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.status < 400, resp.read()
+    except Exception:
+        return False, b""
+
+
+def fetch_usage(m: Metrics):
+    """One absolute four-second budget, including headers/body, with bounded outstanding work."""
+    if m.usage_response is not None:
+        return m.usage_response
+    if not _usage_http_gate.acquire(blocking=False):
+        m.usage_response = (False, b"")
+        return m.usage_response
+    done = threading.Event()
+    result = [(False, b"")]
+
+    def read():
+        try:
+            result[0] = http_ok(f"{USAGE}/v1/exporter", {"Authorization": f"Bearer {MGMT_KEY}"},
+                                timeout=USAGE_DEADLINE_SECONDS)
+        finally:
+            done.set()
+            _usage_http_gate.release()
+
+    # A server trickling bytes cannot keep the scrape open, or create an unbounded queue
+    # of requests. A late result belongs only to this scrape and is never reused.
+    threading.Thread(target=read, daemon=True).start()
+    m.usage_response = result[0] if done.wait(USAGE_DEADLINE_SECONDS) else (False, b"")
+    return m.usage_response
+
+
+def usage_job_outcomes(data):
+    """Job samples and the service's own error flag (None when absent); raises when malformed.
+    Job outcomes are newer than the rest: an older prox-usage has neither key, and that is fine."""
+    samples = []
+    if "jobs" in data:
+        if not isinstance(data["jobs"], dict):
+            raise ValueError("invalid prox-usage job outcomes")
+        for kind, outcome in sorted(data["jobs"].items()):
+            if not isinstance(outcome, dict):
+                raise ValueError("invalid prox-usage job outcome")
+            for result in ("success", "failure"):
+                at = outcome[f"last_{result}_seconds"]
+                if at is None:
+                    continue  # never happened: no series, so alerts pair it with absent()
+                if isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at) or at < 0:
+                    raise ValueError("invalid prox-usage job outcome time")
+                samples.append((result, kind, at))
+    if "jobs_outcome_error" not in data:
+        return samples, None
+    if not isinstance(data["jobs_outcome_error"], bool):
+        raise ValueError("invalid prox-usage job outcome error flag")
+    return samples, data["jobs_outcome_error"]
+
+
+def collect_usage_health(m: Metrics):
+    ok, body = fetch_usage(m)
+    m.add("proxd_up", "gauge", "Service reachable.", int(ok), service="usage")
+    if not ok:
+        raise RuntimeError("prox-usage health unavailable")
+    data = json.loads(body)
+    if data["schema_version"] != 1 or not isinstance(data["sources"], list):
+        raise ValueError("invalid prox-usage source health")
+    samples = []
+    for source in data["sources"]:
+        if not isinstance(source["instance"], str) or not isinstance(source["subscribed"], bool):
+            raise ValueError("invalid prox-usage subscription state")
+        age = source["last_event_age_seconds"]
+        if age is not None and (isinstance(age, bool) or not isinstance(age, (int, float)) or
+                                not math.isfinite(age) or age < 0):
+            raise ValueError("invalid prox-usage event age")
+        samples.append((source["instance"], source["subscribed"], age))
+    for instance, subscribed, age in samples:
+        m.add("proxd_usage_source_subscribed", "gauge", "1 when the usage source is subscribed.",
+              int(subscribed), instance=instance)
+        m.add("proxd_usage_source_last_event_age_seconds", "gauge",
+              "Seconds since this collector received an event; NaN until first event.",
+              math.nan if age is None else age, instance=instance)
+    # A bad job field must never hide source health: the job block is its own
+    # all-or-nothing unit. Malformed means no job times and the error flag raised.
+    try:
+        job_samples, outcome_error = usage_job_outcomes(data)
+    except (KeyError, ValueError):
+        job_samples, outcome_error = [], True
+    for result, kind, at in job_samples:
+        m.add(f"proxd_usage_job_last_{result}_timestamp_seconds", "gauge",
+              f"Time of this usage job's last {result}; no series until it has one.", at, kind=kind)
+    if outcome_error is not None:
+        m.add("proxd_usage_job_outcome_error", "gauge",
+              "1 when the usage service's job outcomes could not be read.", int(outcome_error))
+
+
+def collect_usage(m: Metrics):
+    # The writer owns folding, aliases and pricing. One authenticated read, no local cache or SQL.
+    ok, body = fetch_usage(m)
+    if not ok:
+        raise RuntimeError("prox-usage exporter unavailable")
+    data = json.loads(body)
+    if data["schema_version"] != 1 or data["rate_book_loaded"] is not True or data["client_aliases_loaded"] is not True:
+        raise ValueError("prox-usage exporter is not ready for counter cutover")
+    if not isinstance(data["groups"], list):
+        raise ValueError("invalid prox-usage exporter groups or sources")
+    samples = []
+    unpriced = set()  # (provider, model) with traffic that the rate book cannot price
+
+    def add(name, kind, help_text, value, **labels):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError("invalid prox-usage exporter measurement")
+        labels["source"] = USAGE_SOURCE
+        samples.append((name, kind, help_text, value, labels))
+
+    for row in data["groups"]:
+        base = dict(provider=row["provider"], model=row["model"], account=row["account"], client=row["client"])
+        if row["status"] not in ("success", "failed"):
+            raise ValueError("invalid prox-usage request status")
+        add("proxd_requests_total", "counter", "Requests through the proxy.", row["requests"], status=row["status"], **base)
+        # No cost with no token usage (e.g. failed calls) is nothing to price, not a missing rate.
+        if row["cost_usd"] is None and row["requests"] > 0 and (
+                any(row["tokens"][kind] for kind in ("input", "output", "cached", "reasoning"))
+                or any(row["cache"][kind] for kind in ("read", "write"))):
+            unpriced.add((row["provider"], row["model"]))
+        for kind in ("input", "output", "cached", "reasoning"):
+            add("proxd_tokens_total", "counter", "Tokens by type (cached and reasoning are subsets).",
+                row["tokens"][kind], type=kind, **base)
+        add("proxd_latency_seconds_sum", "counter", "Summed end-to-end request latency.", row["latency_seconds_sum"], **base)
+        add("proxd_ttft_seconds_sum", "counter", "Summed time to first token.", row["ttft_seconds_sum"], **base)
+        add("proxd_ttft_seconds_count", "counter", "Requests with a time to first token recorded.", row["ttft_seconds_count"], **base)
+        for kind in ("read", "write"):
+            add("proxd_cache_tokens_total", "counter", "Prompt-cache tokens read and written.",
+                row["cache"][kind], type=kind, **base)
+        add("proxd_latency_seconds_count", "counter", "Requests with latency recorded.", row["latency_seconds_count"], **base)
+        add("proxd_zero_token_success_total", "counter",
+            "Successful requests recorded with 0 tokens (accounting gap).", row["zero_token_success"], **base)
+        if row["cost_usd"] is not None:
+            add("proxd_api_equivalent_cost_usd_total", "counter",
+                "What this traffic would cost at current configured API list prices.", row["cost_usd"], **base)
+    add("proxd_last_request_timestamp_seconds", "gauge", "Time of the newest recorded request.", data["newest_event_time_seconds"])
+    add("proxd_models_priced", "gauge", "Models with a configured price.", data["models_priced"])
+    # Nothing syncs prices any more, so a new model missing from the rate book would be silent.
+    add("proxd_usage_unpriced_models", "gauge", "Models with requests that the rate book cannot price.", len(unpriced))
+    for provider, model in sorted(unpriced):
+        add("proxd_usage_unpriced_model_info", "gauge", "1 per model with requests and no price.", 1,
+            provider=provider, model=model)
+    # Validate the entire counter block before publishing any usage samples.
+    for name, kind, help_text, value, labels in samples:
+        m.add(name, kind, help_text, value, **labels)
+
+
+def collect_quota(m: Metrics):
+    # Advisory only: proxd-rerank's own usage-endpoint reads. The proxy's state is in the
+    # proxd_credential_* metrics (collect_credentials); trust those for availability.
+    state = json.loads(STATE.read_text())
+    m.add("proxd_rerank_last_run_timestamp_seconds", "gauge", "Last successful proxd-rerank run.", state["updated_at"])
+    m.add("proxd_rerank_state_age_seconds", "gauge", "Seconds since the last proxd-rerank run (advisory data age).",
+          max(m.now - state["updated_at"], 0))
+    try:
+        creds = fetch_credentials(m)
+    except Exception:  # the advisory metrics above and below do not need the join
+        creds = []
+    by_auth = {(c["_instance"], c.get("auth_index")): c for c in creds}
+    by_email = {(c.get("provider"), c.get("email")): c for c in creds}
+    for a in state["accounts"]:
+        lab = dict(provider=a["provider"], account=a["account"])
+        cred = by_auth.get((a.get("instance"), a.get("auth_index"))) or by_email.get((a["provider"], a["account"]))
+        if cred:  # new advisory metrics carry instance and auth_index, not the account name
+            alab = dict(instance=cred["_instance"], provider=a["provider"], auth_index=cred.get("auth_index"))
+            m.add("proxd_account_advisory_age_seconds", "gauge",
+                  "Age of rerank's reading for the credential (advisory; its probe may have failed since).",
+                  max(m.now - (a.get("observed_at") or state["updated_at"]), 0), **alab)
+            if "probe_status" in a:
+                m.add("proxd_account_advisory_unknown", "gauge",
+                      "1 when rerank's last probe of the credential failed and the reading is carried over.",
+                      1 if a["probe_status"] == "unknown" else 0, **alab)
+        if a.get("used_percent") is not None:
+            m.add("proxd_account_quota_used_percent", "gauge", "Weekly quota used (advisory, from rerank).", a["used_percent"], **lab)
+        if a.get("reset_at"):
+            m.add("proxd_account_quota_reset_timestamp_seconds", "gauge", "Weekly quota reset time (advisory, from rerank).", a["reset_at"], **lab)
+        m.add("proxd_account_limited", "gauge",
+              "1 when rerank's last reading says the account is limited (advisory; see proxd_credential_available for the proxy's state).",
+              1 if a["limited"] else 0, **lab)
+        m.add("proxd_account_rank", "gauge", "Advisory soonest-reset order within its provider (1 = soonest; not the proxy's routing).", a["rank"], **lab)
+        if a.get("credits_balance") is not None:
+            m.add("proxd_account_credits_balance", "gauge",
+                  "ChatGPT credit balance (spent once the plan quota is exhausted).", a["credits_balance"], **lab)
+            lo, hi = (a.get("credits_approx_local_messages") or [None, None])[:2]
+            if lo is not None:
+                m.add("proxd_account_credits_approx_messages", "gauge",
+                      "Approximate local Codex messages the credit balance covers.", lo, bound="low", **lab)
+                m.add("proxd_account_credits_approx_messages", "gauge",
+                      "Approximate local Codex messages the credit balance covers.", hi, bound="high", **lab)
+            m.add("proxd_account_credits_overage_reached", "gauge", "1 when the credit overage limit is reached.",
+                  1 if a.get("credits_overage_reached") else 0, **lab)
+        if a.get("reset_credits_available") is not None:
+            m.add("proxd_account_reset_credits_available", "gauge",
+                  "Rate-limit reset credits available (manual quota resets).", a["reset_credits_available"], **lab)
+        for lim in a.get("spend_limits") or []:
+            wl = dict(lab, window=CLAUDE_WINDOW_NAMES.get(lim["window"], lim["window"]))
+            if lim.get("limit_usd") is not None:
+                m.add("proxd_account_spend_limit_usd", "gauge", "Dollar spend limit of a usage window.", lim["limit_usd"], **wl)
+            if lim.get("used_usd") is not None:
+                m.add("proxd_account_spend_used_usd", "gauge", "Dollars used in a usage window.", lim["used_usd"], **wl)
+
+
+def collect_plans(m: Metrics):
+    # One email can hold a plan with each provider, so keys may be "provider/email" with an `account` field.
+    for key, plan in json.loads(PLANS.read_text()).get("accounts", {}).items():
+        m.add("proxd_subscription_monthly_usd", "gauge", "Monthly subscription price of the account.",
+              plan["monthly_usd"], provider=plan.get("provider"), account=plan.get("account", key), plan=plan.get("plan"))
+
+
+def parse_time(value):
+    """RFC 3339 timestamp (nanosecond precision, any offset) -> epoch seconds; None for empty or Go's zero time."""
+    if not value:
+        return None
+    t = re.sub(r"(\.\d{6})\d+", r"\1", str(value)).replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(t)
+    except ValueError:
+        return None
+    return None if dt.year < 2000 else dt.timestamp()
+
+
+def fetch_credentials(m: Metrics):
+    """GET /credentials on every instance, once per scrape: the proxy's own view of each credential."""
+    if m.creds is None:
+        files = []
+        for name, (_, mgmt, inst_id) in PROXIES.items():
+            ok, body = http_ok(f"{mgmt}/credentials", {"Authorization": f"Bearer {MGMT_KEY}"})
+            if not ok:
+                raise RuntimeError(f"{name} proxy credentials unreadable")
+            files += [{**c, "_instance": inst_id} for c in json.loads(body).get("files", [])]
+        m.creds = files
+    return m.creds
+
+
+# Quota signals the proxy records from upstream response headers (credential level and per model).
+CLAUDE_SIGNAL = re.compile(r"^anthropic-ratelimit-unified-(?:(\w+)-)?(utilization|reset|status)$", re.I)
+CODEX_SIGNAL = re.compile(r"^x-codex-(primary|secondary)-(used-percent|reset-at)$", re.I)
+
+
+def _number(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def collect_quota_signals(m: Metrics, lab, model, quota):
+    observed = parse_time((quota or {}).get("observed_at"))
+    if observed is None:
+        return
+    lab = dict(lab, model=model or "all")
+    m.add("proxd_credential_quota_observed_timestamp_seconds", "gauge",
+          "When the proxy last observed upstream quota signals for the credential (model all = credential level).",
+          observed, **lab)
+    m.add("proxd_credential_quota_age_seconds", "gauge",
+          "Seconds since the proxy last observed quota signals (stale readings are not current truth).",
+          max(m.now - observed, 0), **lab)
+    signals = quota.get("signals") or {}
+    codex_windows = {w: signals.get(f"X-Codex-{w.title()}-Window-Minutes") for w in ("primary", "secondary")}
+    for key, raw in signals.items():
+        cm, xm = CLAUDE_SIGNAL.match(key), CODEX_SIGNAL.match(key)
+        if cm:
+            window, kind = (cm.group(1) or "unified").lower(), cm.group(2).lower()
+        elif xm:
+            window, kind = xm.group(1).lower(), xm.group(2).lower()
+            if codex_windows.get(window) in (None, "", "0"):  # unused secondary window reports zeros
+                continue
+        else:
+            continue
+        wl = dict(lab, window=window)
+        if kind in ("utilization", "used-percent", "reset", "reset-at") and _number(raw) is None:
+            continue
+        if kind in ("utilization", "used-percent"):
+            ratio = _number(raw) / (100 if kind == "used-percent" else 1)
+            m.add("proxd_credential_quota_used_ratio", "gauge", "Quota window used, 0-1, from the proxy's signals.", ratio, **wl)
+        elif kind in ("reset", "reset-at"):
+            m.add("proxd_credential_quota_reset_timestamp_seconds", "gauge",
+                  "Quota window reset time from the proxy's signals.", _number(raw), **wl)
+        else:
+            m.add("proxd_credential_quota_status_info", "gauge",
+                  "Upstream quota window status from the proxy's signals (value always 1).", 1, status=raw, **wl)
+
+
+def collect_credentials(m: Metrics):
+    for c in fetch_credentials(m):
+        state = "disabled" if c.get("disabled") else (c.get("status") or "unknown")
+        # Codex and Claude word a quota limit differently; neither means the login is broken.
+        if state == "error" and any(s in (c.get("status_message") or "") for s in ("usage_limit_reached", "rate_limit_error")):
+            state = "cooldown"
+        m.add("proxd_credential_info", "gauge", "Credential status (value always 1).", 1,
+              provider=c.get("provider"), account=c.get("email") or c.get("name"), status=state)
+
+        # Proxy truth, labelled by instance and auth_index (no account names).
+        lab = dict(instance=c["_instance"], provider=c.get("provider"), auth_index=c.get("auth_index"))
+        retry = parse_time(c.get("next_retry_after"))
+        cooldowns = [d for d in c.get("cooldowns") or [] if (parse_time(d.get("retry_at")) or 0) > m.now]
+        cooling = (retry is not None and retry > m.now) or bool(cooldowns)
+        if c.get("disabled"):
+            kind = "disabled"
+        elif cooling:
+            kind = "cooling"
+        elif c.get("unavailable"):
+            kind = "unavailable"
+        else:
+            kind = "available"
+        m.add("proxd_credential_state", "gauge",
+              "Proxy's state of the credential: available, cooling (quota/error deadline pending), unavailable or disabled (value always 1).",
+              1, state=kind, status=c.get("status"), **lab)
+        m.add("proxd_credential_available", "gauge",
+              "1 when the proxy would route to this credential now (not disabled, unavailable or cooling).",
+              1 if kind == "available" else 0, **lab)
+        m.add("proxd_credential_quota_blocked", "gauge", "1 when the proxy has the credential blocked on quota.",
+              1 if c.get("quota_blocked") else 0, **lab)
+        if retry is not None:
+            m.add("proxd_credential_next_retry_timestamp_seconds", "gauge",
+                  "When the proxy will next try the credential (its next_retry_after).", retry, **lab)
+        for d in c.get("cooldowns") or []:
+            deadline = parse_time(d.get("retry_at"))
+            if deadline is not None:
+                m.add("proxd_credential_cooldown_retry_timestamp_seconds", "gauge",
+                      "Deadline of a credential- or model-scope cooldown held by the proxy.", deadline,
+                      scope=d.get("scope"), model=d.get("model_key") or "all", reason=d.get("reason"), **lab)
+        collect_quota_signals(m, lab, "", c.get("quota"))
+        for model, quota in (c.get("model_quotas") or {}).items():
+            collect_quota_signals(m, lab, model, quota)
+
+
+def render() -> str:
+    m = Metrics()
+    for name, (base, _, _) in PROXIES.items():
+        up_proxy, _ = http_ok(f"{base}/healthz")
+        m.add("proxd_up", "gauge", "Service reachable.", 1 if up_proxy else 0, service="proxy", proxy=name)
+    try:
+        collect_usage_health(m)
+    except Exception:
+        print("prox-usage health unavailable", file=sys.stderr)
+    for name, fn in (("usage", collect_usage), ("quota", collect_quota), ("credentials", collect_credentials), ("plans", collect_plans)):
+        start = time.time()
+        try:
+            fn(m)
+            ok = 1
+        except Exception as exc:  # one broken source must not hide the others
+            print(f"{name}: {exc}", file=sys.stderr)
+            ok = 0
+        m.add("proxd_exporter_collector_success", "gauge", "Collector ran without error.", ok, collector=name)
+        m.add("proxd_exporter_collector_seconds", "gauge", "Collector run time.", time.time() - start, collector=name)
+    return m.text()
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.split("?")[0] != "/metrics":
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = render().encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+if __name__ == "__main__":
+    if "--once" in sys.argv:
+        sys.stdout.write(render())
+        sys.exit(0)
+    servers = []
+    for addr in LISTEN:
+        try:
+            servers.append(ThreadingHTTPServer(addr, Handler))
+        except OSError as exc:
+            print(f"cannot listen on {addr}: {exc}", file=sys.stderr)
+    if not servers:
+        sys.exit(1)
+    for srv in servers[1:]:
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    servers[0].serve_forever()

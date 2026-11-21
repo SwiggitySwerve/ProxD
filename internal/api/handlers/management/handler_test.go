@@ -26,7 +26,7 @@ func TestAuthenticateManagementKey_LocalhostIPBan_BlocksCorrectKeyDuringBan(t *t
 	}
 
 	for i := 0; i < 5; i++ {
-		allowed, statusCode, errMsg := h.AuthenticateManagementKey("127.0.0.1", true, "wrong-secret")
+		allowed, statusCode, errMsg := h.AuthenticateManagementKey("127.0.0.1", true, fmt.Sprintf("wrong-secret-%d", i))
 		if allowed {
 			t.Fatalf("expected auth to be denied at attempt %d", i+1)
 		}
@@ -92,6 +92,63 @@ func TestMiddlewareSetsSupportPluginHeader(t *testing.T) {
 			t.Fatalf("X-CPA-SUPPORT-PLUGIN = %q, want %q", got, pluginhost.SupportPluginHeaderValue())
 		}
 	})
+}
+
+// A client repeating one stale or missing key (a dashboard page firing nine
+// requests with an old key; every host-side caller of a rootless podman
+// container shares one source address) is not guessing. Each distinct wrong key
+// counts once, so it cannot lock the correct key out; five distinct wrong keys
+// still ban.
+func TestAuthenticateManagementKey_RepeatedSameWrongKeyDoesNotBan(t *testing.T) {
+	h := &Handler{
+		cfg:            &config.Config{RemoteManagement: config.RemoteManagement{AllowRemote: true}},
+		failedAttempts: make(map[string]*attemptInfo),
+		envSecret:      "test-secret",
+	}
+	const host = "10.0.2.100"
+	for i := 0; i < 9; i++ {
+		if allowed, statusCode, errMsg := h.AuthenticateManagementKey(host, false, "stale-key"); allowed || statusCode != http.StatusUnauthorized {
+			t.Fatalf("stale key attempt %d: allowed=%v status=%d msg=%q, want 401", i+1, allowed, statusCode, errMsg)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if allowed, statusCode, _ := h.AuthenticateManagementKey(host, false, ""); allowed || statusCode != http.StatusUnauthorized {
+			t.Fatalf("missing key attempt %d: allowed=%v status=%d, want 401", i+1, allowed, statusCode)
+		}
+	}
+	if allowed, statusCode, errMsg := h.AuthenticateManagementKey(host, false, "test-secret"); !allowed {
+		t.Fatalf("correct key after repeated stale-key failures: status=%d msg=%q, want allowed", statusCode, errMsg)
+	}
+
+	for i := 0; i < 5; i++ {
+		h.AuthenticateManagementKey(host, false, fmt.Sprintf("guess-%d", i))
+	}
+	if allowed, statusCode, errMsg := h.AuthenticateManagementKey(host, false, "test-secret"); allowed || statusCode != http.StatusForbidden || !strings.HasPrefix(errMsg, "IP banned") {
+		t.Fatalf("after five distinct wrong keys: allowed=%v status=%d msg=%q, want the ban", allowed, statusCode, errMsg)
+	}
+}
+
+// A repeated or missing key still takes one of the five slots: with a stale key
+// and a missing key already counted, three distinct guesses complete the ban.
+func TestAuthenticateManagementKey_RepeatedKeysShareTheFiveSlots(t *testing.T) {
+	h := &Handler{
+		cfg:            &config.Config{RemoteManagement: config.RemoteManagement{AllowRemote: true}},
+		failedAttempts: make(map[string]*attemptInfo),
+		envSecret:      "test-secret",
+	}
+	const host = "10.0.2.100"
+	for i := 0; i < 9; i++ {
+		h.AuthenticateManagementKey(host, false, "stale-key")
+	}
+	for i := 0; i < 3; i++ {
+		h.AuthenticateManagementKey(host, false, "")
+	}
+	for i := 0; i < 3; i++ {
+		h.AuthenticateManagementKey(host, false, fmt.Sprintf("guess-%d", i))
+	}
+	if allowed, statusCode, errMsg := h.AuthenticateManagementKey(host, false, "test-secret"); allowed || statusCode != http.StatusForbidden || !strings.HasPrefix(errMsg, "IP banned") {
+		t.Fatalf("after stale + missing + three guesses: allowed=%v status=%d msg=%q, want the ban", allowed, statusCode, errMsg)
+	}
 }
 
 func TestAuthenticateManagementKey_ReusesVerifiedSecretWithinOneHourTTL(t *testing.T) {
@@ -195,8 +252,9 @@ func TestAuthenticateManagementKey_NeverCachesFailuresAndPreservesIPBan(t *testi
 	}
 
 	// Four wrong attempts must each invoke bcrypt (never negative-cached) and not ban yet.
+	// The fork counts each distinct wrong key once, so every attempt uses its own key.
 	for i := 0; i < 4; i++ {
-		allowed, statusCode, errMsg := h.AuthenticateManagementKey("127.0.0.1", true, "wrong-secret")
+		allowed, statusCode, errMsg := h.AuthenticateManagementKey("127.0.0.1", true, fmt.Sprintf("wrong-secret-%d", i))
 		if allowed || statusCode != http.StatusUnauthorized || errMsg != "invalid management key" {
 			t.Fatalf("wrong attempt %d = (%v, %d, %q), want (false, 401, invalid management key)", i+1, allowed, statusCode, errMsg)
 		}
@@ -215,7 +273,7 @@ func TestAuthenticateManagementKey_NeverCachesFailuresAndPreservesIPBan(t *testi
 
 	// Five consecutive failures after reset trigger the 30-minute IP ban.
 	for i := 0; i < 5; i++ {
-		allowed, statusCode, _ := h.AuthenticateManagementKey("127.0.0.1", true, "wrong-secret")
+		allowed, statusCode, _ := h.AuthenticateManagementKey("127.0.0.1", true, fmt.Sprintf("wrong-secret-%d", i))
 		if allowed || statusCode != http.StatusUnauthorized {
 			t.Fatalf("post-reset failure %d = (%v, %d), want (false, 401)", i+1, allowed, statusCode)
 		}

@@ -493,36 +493,20 @@ func TestIssue7431_ForceCooldownEdgeCases(t *testing.T) {
 			LastError: &Error{Code: credentialQuotaErrorCode, HTTPStatus: 429, Message: "daily limit"},
 			ModelStates: map[string]*ModelState{
 				"model-force": {
-					Unavailable:               true,
-					Status:                    StatusError,
-					NextRetryAfter:            now.Add(5 * time.Minute),
-					Quota:                     QuotaState{Exceeded: true, Reason: "credential_quota", NextRecoverAt: now.Add(5 * time.Minute)},
-					credentialQuotaPropagated: true,
-					credentialQuotaShadow: &ModelState{
-						Unavailable:    true,
-						Status:         StatusError,
-						NextRetryAfter: now.Add(2 * time.Minute),
-						Quota:          QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: now.Add(2 * time.Minute)},
-						LastError:      &Error{Code: ErrorCodeForceCooldown, HTTPStatus: 429, Message: "force model cooldown"},
-						UpdatedAt:      now,
-					},
-					UpdatedAt: now,
+					Unavailable:    true,
+					Status:         StatusError,
+					NextRetryAfter: now.Add(2 * time.Minute),
+					Quota:          QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: now.Add(2 * time.Minute)},
+					LastError:      &Error{Code: ErrorCodeForceCooldown, HTTPStatus: 429, Message: "force model cooldown"},
+					UpdatedAt:      now,
 				},
 				"model-ordinary": {
-					Unavailable:               true,
-					Status:                    StatusError,
-					NextRetryAfter:            now.Add(5 * time.Minute),
-					Quota:                     QuotaState{Exceeded: true, Reason: "credential_quota", NextRecoverAt: now.Add(5 * time.Minute)},
-					credentialQuotaPropagated: true,
-					credentialQuotaShadow: &ModelState{
-						Unavailable:    true,
-						Status:         StatusError,
-						NextRetryAfter: now.Add(2 * time.Minute),
-						Quota:          QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: now.Add(2 * time.Minute)},
-						LastError:      &Error{HTTPStatus: 429, Message: "normal model cooldown"},
-						UpdatedAt:      now,
-					},
-					UpdatedAt: now,
+					Unavailable:    true,
+					Status:         StatusError,
+					NextRetryAfter: now.Add(2 * time.Minute),
+					Quota:          QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: now.Add(2 * time.Minute)},
+					LastError:      &Error{HTTPStatus: 429, Message: "normal model cooldown"},
+					UpdatedAt:      now,
 				},
 				"model-expired-force": {
 					Unavailable:    true,
@@ -2085,13 +2069,7 @@ func TestIssue7431_SameLayerForceCooldownAndPersistenceAndEpochRaces(t *testing.
 			credQuotaForceUntil: now.Add(2 * time.Minute),
 			forceCooldownSeeded: true,
 			ModelStates: map[string]*ModelState{
-				"devin-m1": {
-					Status:                    StatusError,
-					Unavailable:               true,
-					NextRetryAfter:            now.Add(2 * time.Minute),
-					Quota:                     QuotaState{Exceeded: true, Reason: "credential_quota", NextRecoverAt: now.Add(2 * time.Minute)},
-					credentialQuotaPropagated: true,
-				},
+				"devin-m1": {Status: StatusActive},
 			},
 		}
 		refreshed := existing.Clone()
@@ -2287,7 +2265,9 @@ func TestIssue7431_SameLayerForceCooldownAndPersistenceAndEpochRaces(t *testing.
 		mgr.PersistCooldownStates(ctx)
 		foundTenMin := false
 		for _, rec := range recStore.savedRecords() {
-			if rec.Model == "m1" && rec.NextRetryAfter.Equal(tenMinUntil) && rec.IndependentForceCooldownUntil.Equal(tenMinUntil) {
+			// The fork keeps the model's own cooldown in the model state itself, so
+			// its force deadline persists as the record's ForceCooldownUntil.
+			if rec.Model == "m1" && rec.NextRetryAfter.Equal(tenMinUntil) && rec.ForceCooldownUntil.Equal(tenMinUntil) {
 				foundTenMin = true
 			}
 		}

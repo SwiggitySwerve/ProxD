@@ -118,6 +118,10 @@ type Server struct {
 
 	exampleAPIKeySafeModeEnabled bool
 	exampleAPIKeySafeModeActive  atomic.Bool
+
+	// apiNotReady makes proxy API routes answer 503 while startup is still
+	// loading credentials and models (see SetAPIReady).
+	apiNotReady atomic.Bool
 }
 
 // NewServer creates and initializes a new API server instance.
@@ -246,6 +250,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	managementasset.SetCurrentConfig(cfg)
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 	auth.SetTransientErrorCooldownSeconds(cfg.TransientErrorCooldownSeconds)
+	auth.SetUltrafastPolicy(cfg.Routing.Ultrafast)
 	applySignatureCacheConfig(nil, cfg)
 	applyClaudeToolSearchConfig(cfg)
 	// Initialize management handler
@@ -269,6 +274,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// subscribe-config heartbeat connection is healthy.
 	engine.Use(s.homeHeartbeatMiddleware())
 	engine.Use(s.exampleAPIKeySafeModeMiddleware())
+	engine.Use(s.startupReadinessMiddleware())
 
 	// Setup routes
 	s.setupRoutes()

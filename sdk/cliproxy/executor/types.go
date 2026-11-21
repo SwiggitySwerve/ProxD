@@ -33,6 +33,9 @@ const ReasoningEffortMetadataKey = "reasoning_effort"
 // ServiceTierMetadataKey stores the client-requested service tier for usage logs.
 const ServiceTierMetadataKey = "service_tier"
 
+// CodexRoutingHintHeader carries the resolved model and optional service tier.
+const CodexRoutingHintHeader = "X-Codex-Routing-Hint"
+
 // GenerateMetadataKey stores whether the client requested actual generation for usage logs.
 // Missing or true means generation is enabled; only an explicit false disables generation.
 const GenerateMetadataKey = "generate"
@@ -148,6 +151,11 @@ type RequestAfterAuthInterceptResponse struct {
 	ClearHeaders []string
 	// Terminate prevents the selected executor from receiving the request.
 	Terminate bool
+	// TerminateScope narrows Terminate for after-auth interceptors.
+	// Empty or "request" terminates the whole request; "credential" refuses only
+	// the selected credential for this request so selection continues with the
+	// next candidate. Unknown values behave as "request".
+	TerminateScope string
 	// StatusCode is the downstream HTTP status used when Terminate is true.
 	StatusCode int
 	// ResponseHeaders contains downstream response headers used when Terminate is true.

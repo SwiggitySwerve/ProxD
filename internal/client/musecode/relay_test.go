@@ -926,13 +926,15 @@ func TestRelay429AfterPriorGenerationModelStateFailsOverToBackup(t *testing.T) {
 		t.Fatalf("search status = %d, want 429; body=%s", recSearch.Code, recSearch.Body.String())
 	}
 
-	// Verify credential_quota is recorded and propagated to existing model states.
+	// Verify credential_quota is recorded on the credential and blocks the model
+	// that already has a state. The fork keeps the quota on the credential and
+	// does not copy it into model states; the availability gate applies it.
 	after429, _ := manager.GetByID(credPrimary.ID)
 	if after429 == nil || !after429.Quota.Exceeded || after429.Quota.Reason != auth.ErrorCodeCredentialQuota {
 		t.Fatalf("primary quota = %+v, want Exceeded=true Reason=credential_quota", after429.Quota)
 	}
-	if ms := after429.ModelStates["muse-wonder-1.0"]; ms == nil || !ms.Quota.Exceeded || ms.Quota.Reason != auth.ErrorCodeCredentialQuota {
-		t.Fatalf("primary model state = %+v, want propagated credential_quota", ms)
+	if auth.IsAuthAvailableForModel(after429, "muse-wonder-1.0", time.Now()) {
+		t.Fatalf("primary is available for muse-wonder-1.0 under a credential quota: %+v", after429.ModelStates["muse-wonder-1.0"])
 	}
 
 	// 2. Subsequent /muse-code/config must skip cooled credPrimary and hit credBackup.

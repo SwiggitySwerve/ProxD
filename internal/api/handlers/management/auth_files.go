@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/credentialweight"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -132,7 +133,7 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	if pagination.enabled {
 		matching := make([]*coreauth.Auth, 0, len(auths))
 		for _, auth := range auths {
-			if !matchesAuthFileLookup(auth, nameFilter, authIndexFilter) || !isAuthFileListable(auth) {
+			if !matchesAuthFileLookup(auth, nameFilter, authIndexFilter) || !isAuthFileListable(auth, quota.v8) {
 				continue
 			}
 			matching = append(matching, auth)
@@ -264,7 +265,7 @@ func compareAuthFileListOrder(left, right *coreauth.Auth) int {
 	return strings.Compare(leftIndex, rightIndex)
 }
 
-func isAuthFileListable(auth *coreauth.Auth) bool {
+func isAuthFileListable(auth *coreauth.Auth, includeConfigKeys bool) bool {
 	if auth == nil {
 		return false
 	}
@@ -274,7 +275,7 @@ func isAuthFileListable(auth *coreauth.Auth) bool {
 	}
 	path := strings.TrimSpace(authAttribute(auth, "path"))
 	if path == "" {
-		return runtimeOnly
+		return runtimeOnly || (includeConfigKeys && coreauth.IsConfigAPIKeyAuth(auth))
 	}
 	if _, errStat := os.Stat(path); os.IsNotExist(errStat) && !runtimeOnly &&
 		(auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api")) {
@@ -661,7 +662,9 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quota authFileQu
 		return nil
 	}
 	path := strings.TrimSpace(authAttribute(auth, "path"))
-	if path == "" && !runtimeOnly {
+	// v8 also lists API keys defined in config; v0 keeps its file-only shape.
+	configKey := quota.v8 && coreauth.IsConfigAPIKeyAuth(auth)
+	if path == "" && !runtimeOnly && !configKey {
 		return nil
 	}
 	name := strings.TrimSpace(auth.FileName)
@@ -726,8 +729,16 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quota authFileQu
 		if accountType != "" {
 			entry["account_type"] = accountType
 		}
-		if account != "" {
+		// For API-key credentials AccountInfo returns the raw key; never list it.
+		if account != "" && accountType != "api_key" {
 			entry["account"] = account
+		}
+	}
+	if quota.v8 {
+		entry["kind"] = "auth_file"
+		if configKey {
+			entry["kind"] = "config_api_key"
+			entry["source"] = "config"
 		}
 	}
 	if !auth.CreatedAt.IsZero() {
@@ -803,6 +814,11 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quota authFileQu
 		entry["request_retry"] = requestRetry
 	}
 	if quota.v8 {
+		entry["lifecycle"] = credentialLifecycle(auth)
+		// Which proxy instance owns this credential; omitted when CLIPROXY_INSTANCE_ID is unset.
+		if instanceID := redisqueue.DeploymentInstanceID(); instanceID != "" {
+			entry["instance_id"] = instanceID
+		}
 		// OAuth login entry the credential was signed in through; multi-entry plugins store it
 		// next to the provider, and the deprecated v0 route keeps its frozen response shape.
 		if oauthProvider := authOAuthProvider(auth); oauthProvider != "" {

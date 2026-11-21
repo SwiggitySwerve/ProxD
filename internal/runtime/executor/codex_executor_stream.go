@@ -122,10 +122,17 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 	sanitizeOpenAIResponsesReasoningEncryptedContentWithCompatModelAndBaseURLDoc(ctx, "codex executor", doc, isCompat, targetModel, baseURL)
 
+	sessionInstructions, errSession := helps.PrepareCodexSessionInstructions(ctx, doc, req, opts, nil, nil, codexCompactionSummaryFromContext(ctx))
+	if errSession != nil {
+		return nil, errSession
+	}
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, upstreamBody, err := e.cacheHelperDoc(ctx, from, url, req, doc, auth, opts.Headers)
 	if err != nil {
 		return nil, err
+	}
+	if errFinal := sessionInstructions.CheckFinal(upstreamBody); errFinal != nil {
+		return nil, errFinal
 	}
 	body = upstreamBody
 	upstreamModel := strings.TrimSpace(doc.Get("model").String())
@@ -143,6 +150,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if errValidate := helps.ValidateCodexHostedImageGenerationDoc(doc, httpReq.Header, e.cfg, !useSIWC && !codexAuthUsesAPIKey(auth)); errValidate != nil {
 		return nil, errValidate
 	}
+	if errTier := helps.ValidateCodexServiceTier(auth, upstreamBody, httpReq.Header); errTier != nil {
+		return nil, errTier
+	}
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -153,7 +163,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		URL:       url,
 		Method:    http.MethodPost,
 		Headers:   httpReq.Header.Clone(),
-		Body:      upstreamBody,
+		Body:      sessionInstructions.LogBody(upstreamBody),
 		Provider:  e.Identifier(),
 		AuthID:    authID,
 		AuthLabel: authLabel,

@@ -28,27 +28,30 @@ type CooldownStateRecord struct {
 	Quota          QuotaState `json:"quota,omitempty"`
 	LastError      *Error     `json:"last_error,omitempty"`
 	UpdatedAt      time.Time  `json:"updated_at"`
-	// IndependentState preserves a model's own cooldown beneath an
-	// auth-level credential-quota layer so a restart cannot lose the
-	// distinction and quota restoration keeps reinstate-exactly semantics.
-	IndependentState *ModelState `json:"independent_state,omitempty"`
-	// CredentialQuotaPropagated preserves wrap provenance for models that
-	// carry no independent layer (e.g. the reporting model itself).
-	CredentialQuotaPropagated bool `json:"credential_quota_propagated,omitempty"`
+	// IndependentState, CredentialQuotaPropagated and
+	// IndependentCooldownSignals are read only from records written while the
+	// credential quota was copied into every model state: IndependentState is
+	// that model's own cooldown. They are no longer written.
+	IndependentState          *ModelState `json:"independent_state,omitempty"`
+	CredentialQuotaPropagated bool        `json:"credential_quota_propagated,omitempty"`
 	// CooldownSignals persists bounded rejected quota headers captured when
 	// this cooldown was recorded without touching passive Quota.Signals watermarks.
-	CooldownSignals map[string]string `json:"cooldown_signals,omitempty"`
-	// IndependentCooldownSignals persists CooldownSignals for IndependentState.
+	CooldownSignals            map[string]string `json:"cooldown_signals,omitempty"`
 	IndependentCooldownSignals map[string]string `json:"independent_cooldown_signals,omitempty"`
-	// ForceCooldownUntil persists the exact outer ErrorCodeForceCooldown deadline
-	// (credQuotaForceUntil for wrapped model records, model/auth forceCooldownUntil otherwise),
-	// preventing longer ordinary extensions or sibling shadows from inflating it on restore.
+	// Observation persists the last passive quota snapshot for this pair. A
+	// record may carry only an observation; such records have a zero
+	// NextRetryAfter and never restore a cooldown.
+	Observation *QuotaObservationRecord `json:"observation,omitempty"`
+	// ForceCooldownUntil persists the exact ErrorCodeForceCooldown deadline of the
+	// model or auth this record describes, so a longer ordinary extension cannot
+	// inflate it on restore.
 	ForceCooldownUntil time.Time `json:"force_cooldown_until,omitempty"`
 	// CredQuotaForceCooldownUntil persists auth-level credential_quota force provenance
 	// independently from model-less auth ForceCooldownUntil when both coexist on an auth.
 	CredQuotaForceCooldownUntil time.Time `json:"cred_quota_force_cooldown_until,omitempty"`
 	// IndependentForceCooldownUntil persists the exact ErrorCodeForceCooldown deadline
-	// for IndependentState beneath a credential_quota wrap.
+	// for IndependentState beneath a credential_quota wrap. Read only, like
+	// IndependentState; never written.
 	IndependentForceCooldownUntil time.Time `json:"independent_force_cooldown_until,omitempty"`
 	// ForceCooldownEvaluated marks records produced by provenance-aware versions so
 	// a zero ForceCooldownUntil means "explicitly ordinary" rather than legacy unknown.
@@ -61,13 +64,15 @@ type CooldownStateRecord struct {
 	// does not misclassify the remaining quota force window across restarts.
 	QuotaForceCooldownUntil time.Time `json:"quota_force_cooldown_until,omitempty"`
 	// IndependentQuotaForceCooldownUntil persists QuotaForceCooldownUntil for
-	// IndependentState beneath a credential_quota wrap.
+	// IndependentState beneath a credential_quota wrap. Read only, like
+	// IndependentState; never written.
 	IndependentQuotaForceCooldownUntil time.Time `json:"independent_quota_force_cooldown_until,omitempty"`
 	// NonQuotaCooldownUntil persists the deadline of any active non-quota
 	// cooldown layer even after a subsequent 429 overwrites LastError.
 	NonQuotaCooldownUntil time.Time `json:"non_quota_cooldown_until,omitempty"`
 	// IndependentNonQuotaCooldownUntil persists NonQuotaCooldownUntil for
-	// IndependentState beneath a credential_quota wrap.
+	// IndependentState beneath a credential_quota wrap. Read only, like
+	// IndependentState; never written.
 	IndependentNonQuotaCooldownUntil time.Time `json:"independent_non_quota_cooldown_until,omitempty"`
 }
 

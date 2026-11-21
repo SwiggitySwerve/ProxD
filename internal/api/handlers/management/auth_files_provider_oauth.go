@@ -25,6 +25,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/providerspec"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -421,8 +422,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 }
 
 func isIdentitylessOAuthProvider(provider string) bool {
-	trimmed := strings.ToLower(strings.TrimSpace(provider))
-	return trimmed == "kimi" || trimmed == "kimi-ai"
+	return providerspec.For(provider).IdentitylessLogin
 }
 
 func matchesOAuthRecoveryTarget(target oauthRecoveryTarget, email, accountID, candidateFileName string) bool {
@@ -571,6 +571,12 @@ func (h *Handler) commitAndCompleteBuiltinOAuthSession(ctx context.Context, stat
 		return "", false
 	}
 	savedPath, errSave := h.saveTokenRecord(ctx, record)
+	var notAccepted *providerNotAcceptedError
+	if errors.As(errSave, &notAccepted) {
+		log.Warnf("%s OAuth login not saved: %v", record.Provider, errSave)
+		FailOAuthSessionCommit(state, "provider_not_accepted")
+		return "", false
+	}
 	if !alwaysTrackOutcome && !isTargeted {
 		if errSave != nil {
 			log.Errorf("%s: %v", failSaveMessage, errSave)
@@ -1382,6 +1388,14 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 					c.JSON(http.StatusOK, gin.H{"status": "error", "error": "Authentication failed"})
 					return
 				}
+				// The session's provider may have been removed from the allowlist since it started;
+				// saveTokenRecord rechecks each returned credential.
+				if errAccepted := h.checkAcceptedProvider(provider); errAccepted != nil {
+					log.WithError(errAccepted).WithField("provider", provider).Warn("plugin OAuth login not saved")
+					FailOAuthSessionCommit(state, "provider_not_accepted")
+					c.JSON(http.StatusOK, gin.H{"status": "error", "error": "provider_not_accepted"})
+					return
+				}
 				target, hasTarget := GetOAuthSessionTarget(state)
 				isTargeted := hasTarget && strings.TrimSpace(target.AuthID) != ""
 				if isTargeted {
@@ -1407,8 +1421,13 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 				}
 				if errSave := h.savePluginLoginRecords(ctx, records); errSave != nil {
 					log.WithError(errSave).WithField("provider", provider).Error("failed to save plugin auth tokens")
-					FailOAuthSessionCommit(state, "Failed to save authentication tokens")
-					c.JSON(http.StatusOK, gin.H{"status": "error", "error": "Failed to save authentication tokens"})
+					message := "Failed to save authentication tokens"
+					var notAccepted *providerNotAcceptedError
+					if errors.As(errSave, &notAccepted) {
+						message = "provider_not_accepted"
+					}
+					FailOAuthSessionCommit(state, message)
+					c.JSON(http.StatusOK, gin.H{"status": "error", "error": message})
 					return
 				}
 				if isTargeted && len(records) == 1 && records[0] != nil {
@@ -1804,6 +1823,12 @@ func (h *Handler) savePluginLoginRecords(ctx context.Context, records []*coreaut
 	if h != nil {
 		h.pluginLoginSaveMu.Lock()
 		defer h.pluginLoginSaveMu.Unlock()
+	}
+	// Refuse the whole login before the first write; saveTokenRecord still rechecks each record.
+	for _, record := range records {
+		if errAccepted := h.checkAcceptedAuth(record); errAccepted != nil {
+			return errAccepted
+		}
 	}
 	rollbacks := make([]savedPluginRecordRollback, 0, len(records))
 	for _, record := range records {

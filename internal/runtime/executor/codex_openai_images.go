@@ -124,6 +124,9 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 		alignCodexContentEncoding(request)
 	}
 	prepareHeaders(httpReq)
+	if errTier := helps.ValidateCodexServiceTier(auth, body, httpReq.Header); errTier != nil {
+		return resp, errTier
+	}
 	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq.Header.Clone(), body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
@@ -234,6 +237,9 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 		alignCodexContentEncoding(request)
 	}
 	prepareHeaders(httpReq)
+	if errTier := helps.ValidateCodexServiceTier(auth, body, httpReq.Header); errTier != nil {
+		return nil, errTier
+	}
 	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq.Header.Clone(), body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
@@ -383,6 +389,9 @@ func (e *CodexExecutor) executeDirectOpenAIImage(ctx context.Context, auth *clip
 		alignCodexContentEncoding(request)
 	}
 	prepareHeaders(httpReq)
+	if errTier := helps.ValidateCodexServiceTier(auth, body, httpReq.Header); errTier != nil {
+		return resp, errTier
+	}
 	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq.Header.Clone(), body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
@@ -456,6 +465,9 @@ func (e *CodexExecutor) executeDirectOpenAIImageStream(ctx context.Context, auth
 		alignCodexContentEncoding(request)
 	}
 	prepareHeaders(httpReq)
+	if errTier := helps.ValidateCodexServiceTier(auth, body, httpReq.Header); errTier != nil {
+		return nil, errTier
+	}
 	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq.Header.Clone(), body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)

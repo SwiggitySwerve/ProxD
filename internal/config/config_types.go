@@ -136,6 +136,16 @@ type ClaudeConfig struct {
 	// KV) is active, session date pins are persisted permanently and
 	// session-date-pin-days is ignored.
 	SessionDatePinDays *int `yaml:"session-date-pin-days" json:"session-date-pin-days"`
+	// OAuthIncludeCreateAPIKey controls whether new Claude OAuth authorization
+	// URLs request the org:create_api_key scope in addition to ClaudeOAuthScope.
+	// Nil defaults to true to match native Claude Code.
+	OAuthIncludeCreateAPIKey *bool `yaml:"oauth-include-create-api-key,omitempty" json:"oauth-include-create-api-key,omitempty"`
+}
+
+// OAuthIncludeCreateAPIKeyEnabled reports whether Claude OAuth authorization
+// requests should include the org:create_api_key scope.
+func (c *ClaudeConfig) OAuthIncludeCreateAPIKeyEnabled() bool {
+	return c == nil || c.OAuthIncludeCreateAPIKey == nil || *c.OAuthIncludeCreateAPIKey
 }
 
 // DefaultClaudeSessionDatePinDays is the session date pin retention applied
@@ -565,7 +575,7 @@ type QuotaExceeded struct {
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
-	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first".
+	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first", "soonest-reset".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 
 	// SessionAffinity enables universal session-sticky routing for all clients.
@@ -601,6 +611,23 @@ type RoutingConfig struct {
 	//     keep the binding and return the error (or retry the same credential) instead.
 	// Ignored when SessionAffinity is false.
 	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
+
+	// Ultrafast names the Codex credentials allowed to serve the "ultrafast" service tier.
+	// Local patch (see LOCAL-PATCH.md). Leaving it empty denies ultrafast for every credential.
+	Ultrafast UltrafastConfig `yaml:"ultrafast,omitempty" json:"ultrafast,omitempty"`
+}
+
+// UltrafastConfig lists the credentials entitled to the "ultrafast" service tier.
+// A Codex credential is allowed when it matches any entry in any list. All lists empty
+// means no credential is allowed.
+type UltrafastConfig struct {
+	// AccountIDs match the Codex "account_id" stored in the auth file metadata (preferred).
+	AccountIDs []string `yaml:"account-ids,omitempty" json:"account-ids,omitempty"`
+	// AuthIDs match the credential id, which is the auth file name.
+	AuthIDs []string `yaml:"auth-ids,omitempty" json:"auth-ids,omitempty"`
+	// Emails match the auth file "email" metadata. Not unique across providers, so it is
+	// only used when listed here.
+	Emails []string `yaml:"emails,omitempty" json:"emails,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -681,7 +708,7 @@ type PayloadConfig struct {
 	Override []PayloadRule `yaml:"override" json:"override"`
 	// OverrideRaw defines rules that always set raw JSON values, overwriting any existing values.
 	OverrideRaw []PayloadRule `yaml:"override-raw" json:"override-raw"`
-	// Replace defines ordered literal replacements in selected user messages.
+	// Replace defines ordered literal and Go RE2 regex replacements in selected strings.
 	Replace []PayloadReplaceRule `yaml:"replace" json:"replace"`
 	// Filter defines rules that remove parameters from the payload by JSON path.
 	Filter []PayloadFilterRule `yaml:"filter" json:"filter"`

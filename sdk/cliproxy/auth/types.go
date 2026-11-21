@@ -21,6 +21,7 @@ import (
 	"github.com/gin-gonic/gin"
 	baseauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/providerspec"
 )
 
 // PostAuthHook defines a function that is called after an Auth record is created
@@ -60,6 +61,10 @@ type Auth struct {
 	CredentialVersion uint64 `json:"credential_version,omitempty"`
 	// Generation tracks monotonic mutations to resolve scheduler/reconcile snapshot races.
 	Generation uint64 `json:"generation,omitempty"`
+	// quotaRejections counts non-transient 429 results. A quota recheck compares
+	// it before and after its probe, so a rejection that arrives while the probe
+	// is in flight keeps the cooldown even when it leaves the deadline unchanged.
+	quotaRejections uint64
 	// Index is a stable runtime identifier derived from auth metadata (not persisted).
 	Index string `json:"-"`
 	// Provider is the upstream provider key (e.g. "gemini", "claude").
@@ -412,22 +417,6 @@ type ModelState struct {
 	quotaForceCooldownUntil time.Time `json:"-"`
 	nonQuotaCooldownUntil   time.Time `json:"-"`
 	forceCooldownSeeded     bool      `json:"-"`
-	// credentialQuotaShadow holds this model's independent (own-failure)
-	// cooldown layer while the outer fields present the auth-level
-	// credential quota propagated over it, so quota restoration can drop
-	// only the propagated layer and reinstate precisely what the model's
-	// own failures justify (issue #6690). It is nil when no independent
-	// live block exists beneath an outer credential_quota label. Persisted
-	// via CooldownStateRecord.IndependentState (unexported fields are
-	// invisible to JSON, so the record owns the serialized form).
-	credentialQuotaShadow *ModelState `toml:"credential_quota_shadow,omitempty"`
-	// credentialQuotaPropagated marks that credential-quota propagation has
-	// already wrapped this state, distinguishing "no independent block"
-	// from "not yet propagated" so repeated propagation never mistakes its
-	// own earlier layer for an independent block. Persisted via
-	// CooldownStateRecord.CredentialQuotaPropagated across restarts,
-	// including for shadow-less reporting models.
-	credentialQuotaPropagated bool `toml:"credential_quota_propagated,omitempty"`
 }
 
 func recentRequestBucketID(now time.Time) int64 {
@@ -572,26 +561,32 @@ func (o *ProxyConnectionPoolOverride) Clone() *ProxyConnectionPoolOverride {
 	return out
 }
 
+func cloneMetadataValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return cloneMetadataMap(typed)
+	case []string:
+		s := make([]string, len(typed))
+		copy(s, typed)
+		return s
+	case []any:
+		s := make([]any, len(typed))
+		for i, item := range typed {
+			s[i] = cloneMetadataValue(item)
+		}
+		return s
+	default:
+		return value
+	}
+}
+
 func cloneMetadataMap(src map[string]any) map[string]any {
 	if src == nil {
 		return nil
 	}
 	dst := make(map[string]any, len(src))
 	for key, value := range src {
-		switch typed := value.(type) {
-		case map[string]any:
-			dst[key] = cloneMetadataMap(typed)
-		case []string:
-			s := make([]string, len(typed))
-			copy(s, typed)
-			dst[key] = s
-		case []any:
-			s := make([]any, len(typed))
-			copy(s, typed)
-			dst[key] = s
-		default:
-			dst[key] = value
-		}
+		dst[key] = cloneMetadataValue(value)
 	}
 	return dst
 }
@@ -769,23 +764,6 @@ func (m *ModelState) Clone() *ModelState {
 	}
 	copyState := *m
 	copyState.Quota = m.Quota.Clone()
-	if m.LastError != nil {
-		copyState.LastError = m.LastError.Clone()
-	}
-	if m.credentialQuotaShadow != nil {
-		copyState.credentialQuotaShadow = m.credentialQuotaShadow.cloneShallow()
-	}
-	return &copyState
-}
-
-// cloneShallow copies a shadow state one level deep; shadows never nest.
-func (m *ModelState) cloneShallow() *ModelState {
-	if m == nil {
-		return nil
-	}
-	copyState := *m
-	copyState.Quota = m.Quota.Clone()
-	copyState.credentialQuotaShadow = nil
 	if m.LastError != nil {
 		copyState.LastError = m.LastError.Clone()
 	}
@@ -1096,8 +1074,9 @@ func (a *Auth) ExpirationTime() (time.Time, bool) {
 
 // CodexOuterRefreshLead is the conservative proactive refresh lead time before
 // the nominal 10-day Codex OAuth JWT expiration, refreshing tokens well ahead
-// of early upstream access-token invalidation.
-const CodexOuterRefreshLead = 96 * time.Hour
+// of early upstream access-token invalidation. It is Codex's provider registry
+// default (providerspec).
+const CodexOuterRefreshLead = providerspec.CodexOuterRefreshLead
 
 // CodexSIWCRefreshLead is the minimum remaining validity required before refreshing
 // a Sign in with ChatGPT (SIWC) token, matching pi's DEFAULT_OAUTH_MINIMUM_VALIDITY_MS (5 minutes).
@@ -1265,9 +1244,8 @@ func CodexOuterNeedsRefresh(a *Auth, now time.Time) (dueAt time.Time, hasRefresh
 		provider = strings.ToLower(authMetadataString(a, "type"))
 	}
 	lead := ProviderRefreshLead(provider, a.Runtime)
-	if lead == nil && provider == "codex" {
-		d := CodexOuterRefreshLead
-		lead = &d
+	if lead == nil {
+		lead = providerDefaultRefreshLead(provider)
 	}
 	if lead == nil {
 		return time.Time{}, false, false
@@ -1661,8 +1639,13 @@ func ProviderRefreshLead(provider string, runtime any) *time.Duration {
 		}
 		return nil
 	}
-	if provider == "codex" {
-		d := CodexOuterRefreshLead
+	return providerDefaultRefreshLead(provider)
+}
+
+// providerDefaultRefreshLead returns the provider registry's default refresh
+// lead, or nil when the provider has none.
+func providerDefaultRefreshLead(provider string) *time.Duration {
+	if d := providerspec.For(provider).DefaultRefreshLead; d > 0 {
 		return &d
 	}
 	return nil
