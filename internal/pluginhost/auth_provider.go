@@ -14,6 +14,7 @@ import (
 
 	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
+	baseauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -1232,7 +1233,7 @@ func (s *pluginTokenStorage) snapshot() ([]byte, map[string]any) {
 
 // ComparableSnapshot returns a copy of this storage read under its lock, so equality checks
 // (the watcher's authEqual) never read fields a concurrent SetMetadata replaces.
-func (s *pluginTokenStorage) ComparableSnapshot() any {
+func (s *pluginTokenStorage) ComparableSnapshot() baseauth.TokenStorage {
 	if s == nil {
 		return nil
 	}
