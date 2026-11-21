@@ -513,5 +513,15 @@ trial still runs before upstream's moved `publishSelectedAuthMetadata` and the n
 `prepareRequestAuth` failure path. Upstream's plugin executor usage attribution
 (`ApplyPluginExecutorAttribution`, `plugin:<id>` executor type) sits beside the fork's
 plugin usage parsing in `helps/plugin_executor_usage.go`; the exporter sidecar does not
-read the executor type. Codex session instructions are opt-in (only when a client sends
-`client_metadata.cpa_session_instructions`) and do not touch `service_tier`.
+read the executor type. Codex session instructions are opt-in: a client turns them on for
+a session by sending `client_metadata.cpa_session_instructions`, and later turns of an
+armed websocket session can reuse the baseline without sending it again. They do not touch
+`service_tier`. A `start` saves its baseline when the request is prepared, before the
+ultrafast guard and upstream's own final checks, so a request those reject still leaves
+the baseline for that caller and session ID (upstream ordering, not changed here).
+
+Upstream's credential-scoped after-auth refusal (`TerminateScope: "credential"`) meets the
+all-cooled round like this: a refusal before the round starts is part of the error the
+round saves, so it is still returned when no recheck succeeds; a refusal of the half-open
+trial itself is not, and the request returns the saved cooldown 429, the same answer it
+gave before the trial ran.
