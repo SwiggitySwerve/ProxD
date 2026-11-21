@@ -1,10 +1,11 @@
 # Local patch: ultrafast account gate
 
-Base: upstream `v8.0.76` (`7df56074`). Branch: `local/ultrafast-v8.0.65` (ProxD's deploy
+Base: upstream `v8.0.80` (`f5c5681a`). Branch: `local/ultrafast-v8.0.65` (ProxD's deploy
 branch; the name keeps the release it started from).
 
-Upstream `v8.0.76` was merged in on 2026-11-17 with a merge commit, so the fork's
-commits keep their SHAs. See "Upstream v8.0.76 merge" below for what was adapted.
+Upstream `v8.0.76` was merged in on 2026-11-17 and `v8.0.80` on 2026-11-21, each with a
+merge commit, so the fork's commits keep their SHAs. See "Upstream v8.0.76 merge" and
+"Upstream v8.0.80 merge" below for what was adapted.
 
 Rebased from `v8.0.44` on 2026-11-11. Upstream replaced `tidwall/gjson`/`sjson`
 with `MoeForge/moego/ojson` and rewrote the Codex executors and usage parsers on
@@ -489,3 +490,38 @@ Upstream's one-line `AGENTS.md` change (it now also forbids `encoding/json` and 
 in favour of `moego/json` and `moego/regexp`) is held back, because a workflow closes any
 PR that touches `AGENTS.md`. The rule is followed anyway: fork-added code uses the moego
 packages.
+
+## Upstream v8.0.80 merge
+
+`v8.0.80` was upstream `main` at merge time, so the tag was merged. Three files conflicted:
+
+- `internal/runtime/executor/codex_websockets_execute.go`: upstream moved payload
+  finalization, headers and the hosted image-generation check below its new
+  session-instruction preparation (`prepareSessionInstructions`). The ultrafast guard
+  (`helps.ValidateCodexServiceTier`) moved with them and still runs on the final body,
+  right after the image-generation check. `codex_websockets_stream.go` and the HTTP
+  executors merged cleanly with the guard in the same place.
+- `internal/runtime/executor/codex_websockets_duplex.go`: `response.steer` runs the
+  ultrafast guard first (fails the connection, as before), then upstream's
+  `ValidateCodexSessionInstructionMarker` (rejects the frame and keeps the connection).
+- `sdk/cliproxy/auth/conductor.go`: kept the `quotaReconcile` field; dropped
+  `requestPrepareLocks`, which upstream folded into `refreshLocks`.
+
+Checked beyond the conflicts: in every file both sides changed, the fork's diff against
+upstream is the same before and after the merge. In `executeMixedOnce` the all-cooled
+trial still runs before upstream's moved `publishSelectedAuthMetadata` and the new
+`prepareRequestAuth` failure path. Upstream's plugin executor usage attribution
+(`ApplyPluginExecutorAttribution`, `plugin:<id>` executor type) sits beside the fork's
+plugin usage parsing in `helps/plugin_executor_usage.go`; the exporter sidecar does not
+read the executor type. Codex session instructions are opt-in: a client turns them on for
+a session by sending `client_metadata.cpa_session_instructions`, and later turns of an
+armed websocket session can reuse the baseline without sending it again. They do not touch
+`service_tier`. A `start` saves its baseline when the request is prepared, before the
+ultrafast guard and upstream's own final checks, so a request those reject still leaves
+the baseline for that caller and session ID (upstream ordering, not changed here).
+
+Upstream's credential-scoped after-auth refusal (`TerminateScope: "credential"`) meets the
+all-cooled round like this: a refusal before the round starts is part of the error the
+round saves, so it is still returned when no recheck succeeds; a refusal of the half-open
+trial itself does not change the saved error, so the request returns what it would have
+returned before the trial ran (usually the cooldown 429).
