@@ -383,6 +383,30 @@ class ExporterUsageHealth(unittest.TestCase):
         self.assertFalse(any(k.startswith("proxd_usage_job_") for k in values))
         self.assertIn('proxd_usage_source_subscribed{instance="claude-primary"}', values)
 
+    def test_subscription_time_is_published_as_a_number_or_nan(self):
+        data = health_payload()
+        data["sources"][0]["subscribed_at_seconds"] = 1763700000.25
+        data["sources"][1]["subscribed_at_seconds"] = None  # not subscribed
+        values = self.health_values(data)
+        self.assertEqual(values['proxd_usage_source_subscribed_timestamp_seconds{instance="claude-primary"}'], 1763700000.25)
+        self.assertTrue(math.isnan(values['proxd_usage_source_subscribed_timestamp_seconds{instance="codex-primary"}']))
+        self.assertEqual(values['proxd_usage_source_subscribed{instance="claude-primary"}'], 1)
+
+    def test_usage_service_without_subscription_time_adds_no_series(self):
+        values = self.health_values(health_payload())  # an older prox-usage has no such key
+        self.assertFalse(any(k.startswith("proxd_usage_source_subscribed_timestamp_seconds") for k in values))
+        self.assertEqual(values['proxd_usage_source_subscribed{instance="claude-primary"}'], 1)
+        self.assertEqual(values['proxd_usage_source_last_event_age_seconds{instance="claude-primary"}'], 1.5)
+
+    def test_malformed_subscription_time_rejects_the_health_block_like_a_bad_event_age(self):
+        for key in ("subscribed_at_seconds", "last_event_age_seconds"):
+            for bad in (True, "1763700000", -1, math.nan, math.inf, [1763700000]):
+                with self.subTest(key=key, bad=bad):
+                    data = health_payload()
+                    data["sources"][0]["subscribed_at_seconds"] = 1763700000
+                    data["sources"][0][key] = bad
+                    self.assertEqual(set(self.health_values(data, raises=ValueError)), {'proxd_up{service="usage"}'})
+
     def test_malformed_job_fields_keep_source_health_and_raise_the_flag(self):
         good = {"last_success_seconds": 1700000100, "last_failure_seconds": None}
         cases = [("jobs", []), ("jobs", None)] + [("jobs", {"import": bad}) for bad in (

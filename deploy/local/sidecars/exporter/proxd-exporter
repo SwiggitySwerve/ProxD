@@ -180,6 +180,14 @@ def usage_job_outcomes(data):
     return samples, data["jobs_outcome_error"]
 
 
+def source_seconds(value, what):
+    """A source's time field: None, or a finite non-negative number; raises otherwise."""
+    if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                              not math.isfinite(value) or value < 0):
+        raise ValueError(f"invalid prox-usage {what}")
+    return value
+
+
 def collect_usage_health(m: Metrics):
     ok, body = fetch_usage(m)
     m.add("proxd_up", "gauge", "Service reachable.", int(ok), service="usage")
@@ -192,17 +200,22 @@ def collect_usage_health(m: Metrics):
     for source in data["sources"]:
         if not isinstance(source["instance"], str) or not isinstance(source["subscribed"], bool):
             raise ValueError("invalid prox-usage subscription state")
-        age = source["last_event_age_seconds"]
-        if age is not None and (isinstance(age, bool) or not isinstance(age, (int, float)) or
-                                not math.isfinite(age) or age < 0):
-            raise ValueError("invalid prox-usage event age")
-        samples.append((source["instance"], source["subscribed"], age))
-    for instance, subscribed, age in samples:
+        age = source_seconds(source["last_event_age_seconds"], "event age")
+        # Newer than the rest: an older prox-usage has no subscribed_at_seconds, and then
+        # the series is absent (roll-all.sh refuses to roll without it).
+        has_at = "subscribed_at_seconds" in source
+        at = source_seconds(source.get("subscribed_at_seconds"), "subscription time")
+        samples.append((source["instance"], source["subscribed"], age, has_at, at))
+    for instance, subscribed, age, has_at, at in samples:
         m.add("proxd_usage_source_subscribed", "gauge", "1 when the usage source is subscribed.",
               int(subscribed), instance=instance)
         m.add("proxd_usage_source_last_event_age_seconds", "gauge",
               "Seconds since this collector received an event; NaN until first event.",
               math.nan if age is None else age, instance=instance)
+        if has_at:
+            m.add("proxd_usage_source_subscribed_timestamp_seconds", "gauge",
+                  "Unix time this usage source last subscribed; NaN while it is not subscribed.",
+                  math.nan if at is None else at, instance=instance)
     # A bad job field must never hide source health: the job block is its own
     # all-or-nothing unit. Malformed means no job times and the error flag raised.
     try:

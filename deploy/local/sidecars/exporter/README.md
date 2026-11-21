@@ -24,7 +24,10 @@ All 40 existing metric names and types remain. Every usage counter/gauge gains
 other label keys and visible requested-model/account/provider/client values stay
 as before. Health series retain their additive identities, including
 `proxd_up{service="usage"}` and the two `proxd_usage_source_*{instance}`
-gauges. Health and counters share the additive four-second absolute HTTP deadline
+gauges. A third, `proxd_usage_source_subscribed_timestamp_seconds{instance}`, is the
+unix time the source last subscribed (NaN while it is not); it appears only when
+prox-usage sends `sources[].subscribed_at_seconds`, so an older prox-usage shows no series.
+`bin/roll-all.sh` needs it to prove a source reconnected after a hub restart. Health and counters share the additive four-second absolute HTTP deadline
 and at most one outstanding daemon request. The key stays only in the bearer
 header; it is never put in a URL or logs.
 
