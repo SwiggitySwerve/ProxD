@@ -1,6 +1,6 @@
 # ProxD
 
-> **ProxD** is this fork's name for CLIProxyAPI. The deployment branch `local/ultrafast-v8.0.65` runs as three services: `proxd-codex` (Codex, port 8317), `proxd-claude` (Claude, port 8319) and `proxd-gemini` (Gemini, port 8321); the host tooling is in [`deploy/local`](deploy/local/README.md). Upstream: [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI).
+> **ProxD** is this fork's name for CLIProxyAPI. The `main` branch is the deployment branch (PRs target it; until 2026-11-21 it was `local/ultrafast-v8.0.65`) and runs as three services: `proxd-codex` (Codex, port 8317), `proxd-claude` (Claude, port 8319) and `proxd-gemini` (Gemini, port 8321); the host tooling is in [`deploy/local`](deploy/local/README.md). Upstream: [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI).
 
 English | [中文](README_CN.md) | [日本語](README_JA.md)
 

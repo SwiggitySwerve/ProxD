@@ -1,7 +1,9 @@
 # Local patch: ultrafast account gate
 
-Base: upstream `v8.0.80` (`f5c5681a`). Branch: `local/ultrafast-v8.0.65` (ProxD's deploy
-branch; the name keeps the release it started from).
+Base: upstream `v8.0.80` (`f5c5681a`). Branch: `main`, ProxD's only branch: PRs target it and
+hub images are built from it. Until 2026-11-21 that branch was `local/ultrafast-v8.0.65`, a name
+kept from the release it started from; it was merged into `main` and retired (older notes below
+still name it).
 
 Upstream `v8.0.76` was merged in on 2026-11-17 and `v8.0.80` on 2026-11-21, each with a
 merge commit, so the fork's commits keep their SHAs. See "Upstream v8.0.76 merge" and
