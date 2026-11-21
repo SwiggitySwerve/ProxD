@@ -566,16 +566,17 @@ func (h *Handler) commitAndCompleteBuiltinOAuthSession(ctx context.Context, stat
 		}
 	}
 
-	if errAccepted := h.checkAcceptedAuth(record); errAccepted != nil {
-		SetOAuthSessionError(state, "provider_not_accepted")
-		log.Warnf("%s OAuth login not saved: %v", record.Provider, errAccepted)
-		return "", false
-	}
 	applySessionProxyToAuthRecord(record, sessionProxyURL)
 	if errGuard := claimOAuthSessionCommit(state, sessionProvider); errGuard != nil {
 		return "", false
 	}
 	savedPath, errSave := h.saveTokenRecord(ctx, record)
+	var notAccepted *providerNotAcceptedError
+	if errors.As(errSave, &notAccepted) {
+		log.Warnf("%s OAuth login not saved: %v", record.Provider, errSave)
+		FailOAuthSessionCommit(state, "provider_not_accepted")
+		return "", false
+	}
 	if !alwaysTrackOutcome && !isTargeted {
 		if errSave != nil {
 			log.Errorf("%s: %v", failSaveMessage, errSave)
@@ -1387,13 +1388,13 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 					c.JSON(http.StatusOK, gin.H{"status": "error", "error": "Authentication failed"})
 					return
 				}
-				for _, record := range records {
-					if errAccepted := h.checkAcceptedAuth(record); errAccepted != nil {
-						log.WithError(errAccepted).WithField("provider", provider).Warn("plugin OAuth login not saved")
-						FailOAuthSessionCommit(state, "provider_not_accepted")
-						c.JSON(http.StatusOK, gin.H{"status": "error", "error": "provider_not_accepted"})
-						return
-					}
+				// The session's provider may have been removed from the allowlist since it started;
+				// saveTokenRecord rechecks each returned credential.
+				if errAccepted := h.checkAcceptedProvider(provider); errAccepted != nil {
+					log.WithError(errAccepted).WithField("provider", provider).Warn("plugin OAuth login not saved")
+					FailOAuthSessionCommit(state, "provider_not_accepted")
+					c.JSON(http.StatusOK, gin.H{"status": "error", "error": "provider_not_accepted"})
+					return
 				}
 				target, hasTarget := GetOAuthSessionTarget(state)
 				isTargeted := hasTarget && strings.TrimSpace(target.AuthID) != ""
@@ -1420,8 +1421,13 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 				}
 				if errSave := h.savePluginLoginRecords(ctx, records); errSave != nil {
 					log.WithError(errSave).WithField("provider", provider).Error("failed to save plugin auth tokens")
-					FailOAuthSessionCommit(state, "Failed to save authentication tokens")
-					c.JSON(http.StatusOK, gin.H{"status": "error", "error": "Failed to save authentication tokens"})
+					message := "Failed to save authentication tokens"
+					var notAccepted *providerNotAcceptedError
+					if errors.As(errSave, &notAccepted) {
+						message = "provider_not_accepted"
+					}
+					FailOAuthSessionCommit(state, message)
+					c.JSON(http.StatusOK, gin.H{"status": "error", "error": message})
 					return
 				}
 				if isTargeted && len(records) == 1 && records[0] != nil {

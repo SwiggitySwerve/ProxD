@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -211,6 +212,14 @@ type multiPortalAuthProvider struct {
 
 func (m *multiPortalAuthProvider) Identifiers() []string { return m.identifiers }
 
+// credentialOwningAuthProvider declares the runtime provider its logins produce.
+type credentialOwningAuthProvider struct {
+	mockCatalogAuthProvider
+	credentialProviders []string
+}
+
+func (m *credentialOwningAuthProvider) CredentialProviders() []string { return m.credentialProviders }
+
 // S1: credentials are rechecked where they are persisted, which covers the v0 OAuth starts, a v8
 // session whose provider was removed after it started, and the v0 Vertex import route.
 func TestAcceptedProvidersRecheckedWhenCredentialsPersist(t *testing.T) {
@@ -259,6 +268,79 @@ func TestAcceptedProvidersRecheckedWhenCredentialsPersist(t *testing.T) {
 	}
 	if _, errStat := os.Stat(filepath.Join(authDir, "vertex-demo-project.json")); !os.IsNotExist(errStat) {
 		t.Fatalf("rejected vertex credential was written: %v", errStat)
+	}
+}
+
+// S1 and S15: a built-in OAuth commit reports provider_not_accepted from the persistence check, and
+// a plugin session whose provider was removed cannot save a credential for another allowed portal.
+func TestAcceptedProvidersRecheckedAtOAuthCommit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv(acceptedProvidersEnvVar, "")
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir, Port: 8317, AcceptedProviders: []string{"antigravity"}}, coreauth.NewManager(nil, nil, nil))
+
+	builtinState := "accepted-builtin-commit"
+	RegisterOAuthSession(builtinState, "codex")
+	t.Cleanup(func() { CompleteOAuthSession(builtinState) })
+	if _, ok := h.commitAndCompleteBuiltinOAuthSession(context.Background(), builtinState, "codex", "", &coreauth.Auth{
+		ID:       "codex-commit.json",
+		FileName: "codex-commit.json",
+		Provider: "codex",
+		Metadata: map[string]any{"type": "codex", "email": "commit@example.test"},
+	}, "save failed", false); ok {
+		t.Fatalf("built-in commit saved a credential for an unaccepted provider")
+	}
+	if _, status, _ := GetOAuthSession(builtinState); status != "provider_not_accepted" {
+		t.Fatalf("built-in session status = %q, want provider_not_accepted", status)
+	}
+
+	host := pluginhost.New()
+	host.RegisterPluginForTest("zcode-plugin", pluginapi.Plugin{
+		Metadata: pluginapi.Metadata{Name: "ZCode", Version: "1.0.0"},
+		Capabilities: pluginapi.Capabilities{
+			AuthProvider: &testAuthProvider{
+				identifier:  "zcode-zai",
+				identifiers: []string{"zcode-zai", "zcode-bigmodel"},
+				startLogin: func(_ context.Context, req pluginapi.AuthLoginStartRequest) (pluginapi.AuthLoginStartResponse, error) {
+					state := "state-accepted-" + req.Provider
+					t.Cleanup(func() { CancelOAuthSession(state) })
+					return pluginapi.AuthLoginStartResponse{Provider: req.Provider, URL: "https://example.test/login", State: state}, nil
+				},
+				pollLogin: func(context.Context, pluginapi.AuthLoginPollRequest) (pluginapi.AuthLoginPollResponse, error) {
+					return pluginapi.AuthLoginPollResponse{
+						Status: pluginapi.AuthLoginStatusSuccess,
+						Auth: pluginapi.AuthData{
+							Provider:    "zcode",
+							ID:          "zcode-late.json",
+							FileName:    "zcode-late.json",
+							StorageJSON: []byte(`{"type":"zcode","access_token":"tok"}`),
+							Metadata:    map[string]any{"type": "zcode", "portal": "zcode-zai"},
+						},
+					}, nil
+				},
+			},
+		},
+	})
+	h.SetPluginHost(host)
+	t.Setenv(acceptedProvidersEnvVar, "zcode-zai,zcode-bigmodel")
+	startRec := httptest.NewRecorder()
+	startCtx, _ := gin.CreateTestContext(startRec)
+	startCtx.Request = httptest.NewRequest(http.MethodGet, "/v8/management/oauth/auth-url?provider=zcode-bigmodel", nil)
+	h.StartOAuthV8(startCtx)
+	if startRec.Code != http.StatusOK {
+		t.Fatalf("start zcode-bigmodel status = %d, body = %s", startRec.Code, startRec.Body.String())
+	}
+
+	t.Setenv(acceptedProvidersEnvVar, "zcode-zai")
+	pollRec := httptest.NewRecorder()
+	pollCtx, _ := gin.CreateTestContext(pollRec)
+	pollCtx.Request = httptest.NewRequest(http.MethodGet, "/v8/management/get-auth-status?state=state-accepted-zcode-bigmodel", nil)
+	h.GetAuthStatus(pollCtx)
+	if !strings.Contains(pollRec.Body.String(), "provider_not_accepted") {
+		t.Fatalf("poll after removing zcode-bigmodel = %s, want provider_not_accepted", pollRec.Body.String())
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, "zcode-late.json")); !os.IsNotExist(errStat) {
+		t.Fatalf("credential saved for a removed provider: %v", errStat)
 	}
 }
 
@@ -334,6 +416,17 @@ func TestAcceptedProvidersUseSignInIdentity(t *testing.T) {
 	if _, ok := body.Failed[0]["accepted_providers"].([]any); !ok {
 		t.Fatalf("failed entry lacks accepted_providers: %#v", body.Failed[0])
 	}
+
+	// A credential cannot borrow an accepted portal the plugin does not use for its provider.
+	forged := `{"type":"evil","oauth_provider":"zcode-zai","access_token":"a"}`
+	recForged := httptest.NewRecorder()
+	ctxForged, _ := gin.CreateTestContext(recForged)
+	ctxForged.Request = httptest.NewRequest(http.MethodPost, "/v8/management/credentials?name=forged.json", strings.NewReader(forged))
+	ctxForged.Request.Header.Set("Content-Type", "application/json")
+	h.UploadAuthFileV8(ctxForged)
+	if recForged.Code != http.StatusConflict || !strings.Contains(recForged.Body.String(), `"provider":"evil"`) {
+		t.Fatalf("forged portal upload status = %d, body = %s, want 409 for evil", recForged.Code, recForged.Body.String())
+	}
 }
 
 // S5, S6, S9 and S10: the catalog stays valid for ProxUI, problems win, built-ins and the
@@ -347,6 +440,7 @@ func TestProviderCatalogWireAndPrecedence(t *testing.T) {
 	registerFileAuth(t, manager, authDir, &coreauth.Auth{ID: "ag-signin.json", Provider: "antigravity", Status: coreauth.StatusError, RequiresSignIn: true}, `{"type":"antigravity"}`)
 	registerFileAuth(t, manager, authDir, &coreauth.Auth{ID: "gw.json", Provider: "openai-compatible-my gateway", Status: coreauth.StatusActive}, `{"type":"openai-compatible-my gateway"}`)
 	registerFileAuth(t, manager, authDir, &coreauth.Auth{ID: "gone.json", Provider: "gone-plugin", Status: coreauth.StatusActive}, `{"type":"gone-plugin"}`)
+	registerFileAuth(t, manager, authDir, &coreauth.Auth{ID: "compat.json", Provider: "own-endpoint", Status: coreauth.StatusActive, Attributes: map[string]string{"base_url": "https://llm.example.test/v1"}}, `{"type":"own-endpoint","base_url":"https://llm.example.test/v1"}`)
 
 	host := pluginhost.New()
 	host.RegisterPluginWithPriorityForTest("first-plugin", 10, pluginapi.Plugin{
@@ -354,7 +448,7 @@ func TestProviderCatalogWireAndPrecedence(t *testing.T) {
 		Capabilities: pluginapi.Capabilities{
 			AuthProvider: &multiPortalAuthProvider{
 				mockCatalogAuthProvider: mockCatalogAuthProvider{identifier: "dup-provider"},
-				identifiers:             []string{"dup-provider", "codex"},
+				identifiers:             []string{"dup-provider", "codex", "under_score"},
 			},
 		},
 	})
@@ -389,6 +483,33 @@ func TestProviderCatalogWireAndPrecedence(t *testing.T) {
 	if gone.Source != "plugin" || gone.Lifecycle != lifecycleDisabled || gone.PluginID != nil {
 		t.Fatalf("gone-plugin = %+v, want a disabled plugin provider", gone)
 	}
+	if own := catalogEntry(t, resp, "own-endpoint"); own.Source != "builtin" || own.Lifecycle != lifecycleActive {
+		t.Fatalf("own-endpoint = %+v, want an active built-in OpenAI-compatible provider", own)
+	}
+	if under := catalogEntry(t, resp, "under_score"); under.OAuth != nil {
+		t.Fatalf("under_score advertises sign-in the plugin OAuth routes refuse: %+v", under.OAuth)
+	}
+}
+
+// S5: ProxUI's list limits hold however many providers a hub has.
+func TestProviderCatalogListLimits(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv(acceptedProvidersEnvVar, "")
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	accepted := make([]string, 0, 200)
+	for i := 0; i < 300; i++ {
+		id := fmt.Sprintf("p%03d", i)
+		registerFileAuth(t, manager, authDir, &coreauth.Auth{ID: id + ".json", Provider: id, Status: coreauth.StatusActive}, `{"type":"`+id+`"}`)
+		if i < 200 {
+			accepted = append(accepted, id)
+		}
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir, AcceptedProviders: accepted}, manager)
+	resp, _ := fetchCatalog(t, h)
+	if len(resp.Providers) != catalogMaxProviders || len(resp.AcceptedProviders) != catalogMaxAcceptedProviders {
+		t.Fatalf("providers = %d, accepted = %d; want %d and %d", len(resp.Providers), len(resp.AcceptedProviders), catalogMaxProviders, catalogMaxAcceptedProviders)
+	}
 }
 
 // S7: a plugin whose login ID (zcode-zai) differs from its runtime provider (zcode) gets a
@@ -411,7 +532,10 @@ func TestProviderCatalogListsRuntimeProviderOfPluginLogin(t *testing.T) {
 	host.RegisterPluginForTest("zcode-plugin", pluginapi.Plugin{
 		Metadata: pluginapi.Metadata{Name: "ZCode"},
 		Capabilities: pluginapi.Capabilities{
-			AuthProvider: &mockCatalogAuthProvider{identifier: "zcode-zai"},
+			AuthProvider: &credentialOwningAuthProvider{
+				mockCatalogAuthProvider: mockCatalogAuthProvider{identifier: "zcode-zai"},
+				credentialProviders:     []string{"zcode"},
+			},
 			QuotaProvider: &mockQuotaProvider{
 				identifier: "zcode",
 				supported:  []string{"zcode"},
@@ -484,7 +608,12 @@ func TestFetchCredentialQuotaV8Bounds(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	authDir := t.TempDir()
 	manager := coreauth.NewManager(nil, nil, nil)
-	cred := registerFileAuth(t, manager, authDir, &coreauth.Auth{ID: "bounded.json", Provider: "bounded", Status: coreauth.StatusActive}, `{"type":"bounded"}`)
+	cred := registerFileAuth(t, manager, authDir, &coreauth.Auth{ID: "bounded.json", Provider: "bounded", Status: coreauth.StatusActive, Metadata: map[string]any{"type": "bounded"}}, `{"type":"bounded"}`)
+	runtimeOnly, errRuntime := manager.Register(context.Background(), &coreauth.Auth{ID: "runtime-only", Provider: "bounded", Status: coreauth.StatusActive})
+	if errRuntime != nil {
+		t.Fatalf("register runtime-only: %v", errRuntime)
+	}
+	runtimeOnly.EnsureIndex()
 
 	release := make(chan struct{})
 	var started sync.WaitGroup
@@ -529,6 +658,13 @@ func TestFetchCredentialQuotaV8Bounds(t *testing.T) {
 	if rec := post(`{"auth_index":"` + strings.Repeat("a", quotaFetchV8RequestLimit) + `"}`); rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversized request status = %d, want 413", rec.Code)
 	}
+	if rec := post(validBody + strings.Repeat(" ", quotaFetchV8RequestLimit)); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized request with a valid prefix status = %d, want 413", rec.Code)
+	}
+	// A credential without a file still reaches the plugin, with its record but no storage bytes.
+	if rec := post(`{"auth_index":"` + runtimeOnly.Index + `"}`); rec.Code != http.StatusOK {
+		t.Fatalf("runtime-only credential status = %d, body = %s", rec.Code, rec.Body.String())
+	}
 
 	mu.Lock()
 	huge = true
@@ -541,9 +677,9 @@ func TestFetchCredentialQuotaV8Bounds(t *testing.T) {
 	blocking = true
 	mu.Unlock()
 
-	binding, ok := host.ResolveQuotaBinding(context.Background(), "bounded")
-	if !ok || binding.PluginID() != "bounded-plugin" {
-		t.Fatalf("binding = %+v, %v", binding, ok)
+	fetch := func(ctx context.Context) (bool, error) {
+		_, handled, err := host.FetchQuotaForCredential(ctx, "bounded", "", cred.Index, cred.ID)
+		return handled, err
 	}
 	const slots = 4
 	started.Add(slots)
@@ -552,13 +688,13 @@ func TestFetchCredentialQuotaV8Bounds(t *testing.T) {
 		done.Add(1)
 		go func() {
 			defer done.Done()
-			_, _, _ = host.FetchQuotaWithBinding(context.Background(), binding, cred.Index, cred.ID)
+			_, _ = fetch(context.Background())
 		}()
 	}
 	started.Wait()
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, handled, err := host.FetchQuotaWithBinding(canceled, binding, cred.Index, cred.ID); !handled || !errors.Is(err, context.Canceled) {
+	if handled, err := fetch(canceled); !handled || !errors.Is(err, context.Canceled) {
 		t.Fatalf("call past the concurrency limit = handled %v, err %v; want it to wait for a slot", handled, err)
 	}
 	mu.Lock()
@@ -570,11 +706,18 @@ func TestFetchCredentialQuotaV8Bounds(t *testing.T) {
 		t.Fatalf("after slots free status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 
-	// The binding is for provider "bounded"; a credential now under another provider is refused.
+	// A replacement file written before its record is published is not sent to the old plugin.
+	if err := os.WriteFile(cred.Attributes[coreauth.AttributePath], []byte(`{"type":"other"}`), 0o600); err != nil {
+		t.Fatalf("replace file: %v", err)
+	}
+	if handled, err := fetch(context.Background()); !handled || err == nil {
+		t.Fatalf("fetch with a replaced file = handled %v, err %v; want an error", handled, err)
+	}
+	// The credential must still be under the provider the plugin was resolved for.
 	if _, err := manager.Update(context.Background(), &coreauth.Auth{ID: cred.ID, Provider: "other", Status: coreauth.StatusActive, Attributes: cred.Attributes}); err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	if _, handled, err := host.FetchQuotaWithBinding(context.Background(), binding, cred.Index, cred.ID); !handled || err == nil {
+	if handled, err := fetch(context.Background()); !handled || err == nil {
 		t.Fatalf("fetch after provider change = handled %v, err %v; want an error", handled, err)
 	}
 }

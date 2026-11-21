@@ -15,10 +15,12 @@ import (
 
 	"github.com/MoeForge/moego/json"
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/htmlsanitize"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -299,9 +301,29 @@ func (h *Handler) effectiveAcceptedProviders() []string {
 
 // signInProviderID is the one provider identity used for admission: the sign-in provider that
 // StartOAuthV8 takes and the catalog lists as a sign-in entry (a plugin portal, or kimi vs kimi-ai
-// by domain), with built-in aliases folded.
+// by domain), with built-in aliases folded. A portal hint from the credential counts only when
+// the plugin owning that portal also owns the credential's provider; otherwise the credential's
+// own provider is its identity.
 func (h *Handler) signInProviderID(auth *coreauth.Auth) string {
-	return canonicalBuiltinProviderKey(h.resolveTargetOAuthProvider(auth))
+	if auth == nil {
+		return ""
+	}
+	runtimeID := canonicalBuiltinProviderKey(auth.Provider)
+	signInID := canonicalBuiltinProviderKey(h.resolveTargetOAuthProvider(auth))
+	if signInID == runtimeID {
+		return signInID
+	}
+	if runtimeID == "kimi" && signInID == "kimi-ai" {
+		// Built-in Kimi picks its sign-in entry from the credential's domain.
+		return signInID
+	}
+	h.mu.Lock()
+	host := h.pluginHost
+	h.mu.Unlock()
+	if host != nil && host.SameAuthProvider(signInID, auth.Provider) {
+		return signInID
+	}
+	return runtimeID
 }
 
 // checkAcceptedProvider admits a sign-in provider ID only when it is listed exactly (after alias
@@ -374,12 +396,15 @@ func deriveProviderLifecycle(creds providerCatalogCredentials) string {
 }
 
 // collectProviderCredentialCounts counts each listable credential under its runtime provider (the
-// provider /credentials and quota fetch report) and, when it differs, under its sign-in provider
-// too, so sign-in entries and runtime entries both reflect the credentials they own.
-func (h *Handler) collectProviderCredentialCounts(now time.Time) map[string]providerCatalogCredentials {
+// provider /credentials and quota fetch report, unfolded) and, when it differs, under its sign-in
+// provider too, so sign-in entries and runtime entries both reflect the credentials they own. It
+// also reports which runtime providers have a credential the host serves natively (a config API
+// key or an OpenAI-compatible credential with its own endpoint).
+func (h *Handler) collectProviderCredentialCounts(now time.Time) (map[string]providerCatalogCredentials, map[string]bool) {
 	counts := make(map[string]providerCatalogCredentials)
+	native := make(map[string]bool)
 	if h == nil || h.authManager == nil {
-		return counts
+		return counts, native
 	}
 	add := func(providerID, lifecycle string) {
 		entry := counts[providerID]
@@ -398,7 +423,7 @@ func (h *Handler) collectProviderCredentialCounts(now time.Time) map[string]prov
 		if !isAuthFileListable(auth, true) {
 			continue
 		}
-		runtimeID := canonicalBuiltinProviderKey(auth.Provider)
+		runtimeID := strings.ToLower(strings.TrimSpace(auth.Provider))
 		if runtimeID == "" {
 			continue
 		}
@@ -407,9 +432,28 @@ func (h *Handler) collectProviderCredentialCounts(now time.Time) map[string]prov
 		if signInID := h.signInProviderID(auth); signInID != "" && signInID != runtimeID {
 			add(signInID, lifecycle)
 		}
+		if coreauth.IsConfigAPIKeyAuth(auth) || authAttribute(auth, "base_url") != "" || authAttribute(auth, "compat_name") != "" {
+			native[runtimeID] = true
+		}
 	}
-	return counts
+	return counts, native
 }
+
+// nativeRuntimeProviders are the built-in runtime providers that have no OAuth sign-in entry
+// (see baselineExecutorAuths in sdk/cliproxy/service_executors.go).
+var nativeRuntimeProviders = map[string]bool{
+	constant.Gemini:             true,
+	constant.GeminiInteractions: true,
+	"vertex":                    true,
+	"aistudio":                  true,
+	"openai-compatibility":      true,
+}
+
+// ProxUI rejects a catalog with more entries than these.
+const (
+	catalogMaxProviders         = 256
+	catalogMaxAcceptedProviders = 128
+)
 
 var catalogProviderIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
@@ -441,14 +485,15 @@ func catalogDisplayName(raw, fallback string) string {
 	return name
 }
 
-// wireProviderIDs keeps only IDs ProxUI's slug rule accepts; nil stays nil (an open hub).
+// wireProviderIDs keeps only IDs ProxUI's slug rule accepts, up to its list limit; nil stays nil
+// (an open hub).
 func wireProviderIDs(ids []string) []string {
 	if ids == nil {
 		return nil
 	}
 	out := make([]string, 0, len(ids))
 	for _, id := range ids {
-		if catalogProviderIDPattern.MatchString(id) {
+		if catalogProviderIDPattern.MatchString(id) && len(out) < catalogMaxAcceptedProviders {
 			out = append(out, id)
 		}
 	}
@@ -502,7 +547,7 @@ func (h *Handler) GetProviderCatalogV8(c *gin.Context) {
 	}
 
 	accepted := h.effectiveAcceptedProviders()
-	counts := h.collectProviderCredentialCounts(now)
+	counts, nativeProviders := h.collectProviderCredentialCounts(now)
 
 	quotaPluginIDs := map[string]string{}
 	quotaSupportsResetByPlugin := map[string]bool{}
@@ -600,7 +645,7 @@ func (h *Handler) GetProviderCatalogV8(c *gin.Context) {
 			}
 			pid := pluginID
 			creds := counts[id]
-			entriesByID[id] = providerCatalogEntry{
+			entry := providerCatalogEntry{
 				ID:          id,
 				DisplayName: displayName,
 				Source:      "plugin",
@@ -608,15 +653,19 @@ func (h *Handler) GetProviderCatalogV8(c *gin.Context) {
 				Logo:        nonEmptyStringPtr(logoStr),
 				Lifecycle:   deriveProviderLifecycle(creds),
 				Credentials: creds,
-				OAuth: &providerCatalogOAuth{
+				Quota:       resolveQuota(id, false, false),
+			}
+			// Advertise sign-in only for IDs the plugin OAuth start and callback routes accept.
+			if _, errRoute := NormalizePluginOAuthCallbackProvider(id); errRoute == nil {
+				entry.OAuth = &providerCatalogOAuth{
 					Flow:           "browser",
 					Aliases:        []string{},
 					ManualCallback: true,
 					WebUI:          true,
 					Domains:        []string{},
-				},
-				Quota: resolveQuota(id, false, false),
+				}
 			}
+			entriesByID[id] = entry
 		}
 
 		if len(info.OAuthProviderEntries) > 0 {
@@ -663,9 +712,10 @@ func (h *Handler) GetProviderCatalogV8(c *gin.Context) {
 	}
 
 	// 4. Credential-bearing providers not listed yet: runtime providers of plugin logins whose
-	// login ID differs, and uploaded or imported credentials. One that no executor serves belongs
-	// to a plugin that is not loaded (every built-in provider has an executor), so it is a
-	// disabled plugin provider rather than an active built-in.
+	// login ID differs, and uploaded or imported credentials. One that no active plugin owns and
+	// the host does not serve natively belongs to a plugin that is not loaded, so it is a disabled
+	// plugin provider rather than an active built-in. (An executor is no evidence: the host binds a
+	// generic OpenAI-compatible executor to any unknown provider.)
 	for providerID, creds := range counts {
 		if _, exists := entriesByID[providerID]; exists {
 			continue
@@ -689,7 +739,7 @@ func (h *Handler) GetProviderCatalogV8(c *gin.Context) {
 			entry.Source = "plugin"
 			entry.PluginID = nonEmptyStringPtr(htmlsanitize.String(ownerPluginID))
 			entry.DisplayName = catalogDisplayName(pluginNames[ownerPluginID], entry.DisplayName)
-		} else if _, served := h.authManager.Executor(providerID); !served {
+		} else if !nativeRuntimeProviders[providerID] && !nativeProviders[providerID] {
 			entry.Source = "plugin"
 			entry.Lifecycle = lifecycleDisabled
 		}
@@ -705,6 +755,10 @@ func (h *Handler) GetProviderCatalogV8(c *gin.Context) {
 		}
 	}
 	sort.Strings(ids)
+	if len(ids) > catalogMaxProviders {
+		log.Warnf("provider catalog truncated to %d of %d providers", catalogMaxProviders, len(ids))
+		ids = ids[:catalogMaxProviders]
+	}
 
 	providers := make([]providerCatalogEntry, 0, len(ids))
 	for _, id := range ids {

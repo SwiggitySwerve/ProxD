@@ -15,6 +15,7 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -71,14 +72,20 @@ const (
 // Request and response bodies are size-capped, the plugin call has a deadline, and the host
 // bounds how many of these calls run at once.
 func (h *Handler) FetchCredentialQuotaV8(c *gin.Context) {
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, quotaFetchV8RequestLimit)
-	var body credentialQuotaRequest
-	if errBind := c.ShouldBindJSON(&body); errBind != nil {
+	// Read the whole body inside the cap, so an oversized body is refused even when it starts
+	// with a valid object.
+	rawBody, errRead := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, quotaFetchV8RequestLimit))
+	if errRead != nil {
 		var maxBytesErr *http.MaxBytesError
-		if errors.As(errBind, &maxBytesErr) {
+		if errors.As(errRead, &maxBytesErr) {
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body too large"})
 			return
 		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	var body credentialQuotaRequest
+	if errUnmarshal := json.Unmarshal(rawBody, &body); errUnmarshal != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
@@ -104,19 +111,13 @@ func (h *Handler) FetchCredentialQuotaV8(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), quotaFetchV8Timeout)
 	defer cancel()
-	binding, okBinding := host.ResolveQuotaBinding(ctx, auth.Provider)
-	if !okBinding {
-		c.JSON(http.StatusNotImplemented, gin.H{"error": "no quota provider available for credential"})
-		return
-	}
-	if requestedPlugin := strings.TrimSpace(body.PluginID); requestedPlugin != "" && !strings.EqualFold(requestedPlugin, binding.PluginID()) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "quota plugin does not match credential provider"})
-		return
-	}
-
-	quotaResp, handled, errFetch := host.FetchQuotaWithBinding(ctx, binding, auth.Index, auth.ID)
+	quotaResp, handled, errFetch := host.FetchQuotaForCredential(ctx, auth.Provider, body.PluginID, auth.Index, auth.ID)
 	if !handled {
 		c.JSON(http.StatusNotImplemented, gin.H{"error": "no quota provider available for credential"})
+		return
+	}
+	if errors.Is(errFetch, pluginhost.ErrQuotaPluginMismatch) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "quota plugin does not match credential provider"})
 		return
 	}
 	if errFetch != nil {
