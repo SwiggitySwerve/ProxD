@@ -1230,6 +1230,16 @@ func (s *pluginTokenStorage) snapshot() ([]byte, map[string]any) {
 	return s.rawJSON, s.meta
 }
 
+// ComparableSnapshot returns a copy of this storage read under its lock, so equality checks
+// (the watcher's authEqual) never read fields a concurrent SetMetadata replaces.
+func (s *pluginTokenStorage) ComparableSnapshot() any {
+	if s == nil {
+		return nil
+	}
+	raw, meta := s.snapshot()
+	return &pluginTokenStorage{provider: s.provider, rawJSON: raw, meta: meta}
+}
+
 func (s *pluginTokenStorage) SetMetadata(meta map[string]any) {
 	if s == nil {
 		return

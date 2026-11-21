@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	baseauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -610,6 +611,12 @@ func normalizeAuth(a *coreauth.Auth) *coreauth.Auth {
 		return nil
 	}
 	clone := a.Clone()
+	// Plugin storage changes under its own lock during saves; compare a copy read under it.
+	if storage, ok := clone.Storage.(interface{ ComparableSnapshot() any }); ok {
+		if snapshot, okSnapshot := storage.ComparableSnapshot().(baseauth.TokenStorage); okSnapshot {
+			clone.Storage = snapshot
+		}
+	}
 	clone.ClearFileSnapshot()
 	clone.CreatedAt = time.Time{}
 	clone.UpdatedAt = time.Time{}
