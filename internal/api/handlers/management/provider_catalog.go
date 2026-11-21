@@ -122,7 +122,7 @@ func init() {
 		},
 		{
 			ID:             "antigravity",
-			DisplayName:    "Gemini / Antigravity",
+			DisplayName:    "Antigravity",
 			Flow:           "browser",
 			Aliases:        []string{},
 			ManualCallback: true,
