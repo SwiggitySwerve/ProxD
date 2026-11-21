@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
-# roll.sh [--approved] [--dry-run] <staging|claude|codex> <image-tag>
+# roll.sh [--approved] [--dry-run] <staging|claude|codex|gemini> <image-tag>
 #
 #   staging  recreate the staging proxy container from <image-tag>.
 #   claude   live unit proxd-claude.container (container proxd-claude, port 8319).
 #   codex    live unit proxd-codex.container  (container proxd-codex,  port 8317).
+#   gemini   live unit proxd-gemini.container (container proxd-gemini, port 8321).
 #
-# Live targets need --approved. They record the running image to a rollback file,
-# rewrite the unit's Image= line, daemon-reload, restart that one unit, smoke-check
-# /healthz and print the exact rollback command. --dry-run prints what would change
-# and touches nothing. <image-tag> is a full image ref, or a tag of localhost/proxd.
+# Live targets need --approved. They record the unit's current Image= line to a rollback
+# file under <hub data dir>/rollback/ (LIVE_DATA_ROOT, default ~/.local/share/proxd),
+# rewrite that line, daemon-reload, restart that one unit, smoke-check /healthz and print
+# the exact rollback command. The rollback image is the quadlet's Image= line, not what
+# podman reports for the container: podman can show an older alias of the same image
+# (localhost/cli-proxy-api:*). --dry-run prints what would change and touches nothing.
+# <image-tag> is a full image ref, or a tag of localhost/proxd. roll-all.sh rolls all
+# three live hubs in one go.
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/../staging/lib.sh"
 
 SELF=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/roll.sh
 UNIT_DIR=${LIVE_UNIT_DIR:-$HOME/.config/containers/systemd}
+LIVE_DATA=${LIVE_DATA_ROOT:-$HOME/.local/share/proxd}
 APPROVED=0
 DRY_RUN=0
 ARGS=()
@@ -25,15 +31,15 @@ for a in "$@"; do
     *) ARGS+=("$a") ;;
   esac
 done
-[ "${#ARGS[@]}" -eq 2 ] || die "usage: roll.sh [--approved] [--dry-run] <staging|claude|codex> <image-tag>"
+[ "${#ARGS[@]}" -eq 2 ] || die "usage: roll.sh [--approved] [--dry-run] <staging|claude|codex|gemini> <image-tag>"
 TARGET=${ARGS[0]}
 case "${ARGS[1]}" in */*) IMAGE=${ARGS[1]} ;; *) IMAGE="$IMAGE_REPO:${ARGS[1]}" ;; esac
 
-mkdir_rollback() { mkdir -p "$DATA_DIR/rollback"; }
-record_rollback() { # record_rollback <target> <previous-image>
-  mkdir_rollback
-  local f="$DATA_DIR/rollback/$1-$(date -u +%Y%m%dT%H%M%SZ).txt"
-  printf 'target=%s\nprevious_image=%s\nnew_image=%s\n' "$1" "$2" "$IMAGE" > "$f"
+record_rollback() { # record_rollback <dir> <target> <previous-image>
+  mkdir -p "$1"
+  local f # unique: a rollback can follow a failed restart within the same second
+  f=$(mktemp --suffix=.txt "$1/$2-$(date -u +%Y%m%dT%H%M%SZ)-XXXX")
+  printf 'target=%s\nprevious_image=%s\nnew_image=%s\n' "$2" "$3" "$IMAGE" > "$f"
   echo "rollback record: $f"
 }
 
@@ -47,7 +53,7 @@ roll_staging() {
   podman image exists "$IMAGE" || die "image $IMAGE not found (build it with staging/up.sh)"
   [ -s "$DATA_DIR/config.yaml" ] || render_config
   ensure_pod
-  [ -z "$prev" ] || record_rollback staging "$prev"
+  [ -z "$prev" ] || record_rollback "$DATA_DIR/rollback" staging "$prev"
   start_proxy "$IMAGE"
   wait_http "$(proxy_url)/healthz" 60 || die "staging proxy unhealthy after roll; previous image: ${prev:-none}"
   wait_api_ready "$(proxy_url)" 60 || die "staging proxy API not ready after roll; previous image: ${prev:-none}"
@@ -60,6 +66,7 @@ roll_live() {
   case "$TARGET" in
     claude) unit=proxd-claude.container service=proxd-claude.service container=proxd-claude port=8319 ;;
     codex) unit=proxd-codex.container service=proxd-codex.service container=proxd-codex port=8317 ;;
+    gemini) unit=proxd-gemini.container service=proxd-gemini.service container=proxd-gemini port=8321 ;;
   esac
   local unit_path="$UNIT_DIR/$unit"
   [ -f "$unit_path" ] || die "unit file $unit_path not found"
@@ -67,7 +74,7 @@ roll_live() {
   unit_image=$(sed -n 's/^Image=//p' "$unit_path" | head -n1)
   [ -n "$unit_image" ] || die "no Image= line in $unit_path"
   running=$(podman inspect --format '{{.ImageName}}' "$container" 2>/dev/null || true)
-  local rollback_image=${running:-$unit_image}
+  local rollback_image=$unit_image rollback_dir="$LIVE_DATA/$TARGET/rollback"
 
   if [ "$DRY_RUN" = 1 ]; then
     echo "dry-run: nothing will be changed"
@@ -77,13 +84,14 @@ roll_live() {
     echo "  would write: Image=$IMAGE"
     echo "  would run:   systemctl --user daemon-reload && systemctl --user restart $service"
     echo "  would check: curl http://127.0.0.1:$port/healthz"
+    echo "  record in:   $rollback_dir/"
     echo "  rollback:    $SELF $TARGET $rollback_image --approved"
     return
   fi
   [ "$APPROVED" = 1 ] || die "live target '$TARGET' requires --approved (or use --dry-run)"
   podman image exists "$IMAGE" || die "image $IMAGE not found locally; refusing to roll"
 
-  record_rollback "$TARGET" "$rollback_image"
+  record_rollback "$rollback_dir" "$TARGET" "$rollback_image"
   sed -i "s|^Image=.*|Image=$IMAGE|" "$unit_path"
   systemctl --user daemon-reload
   systemctl --user restart "$service"
@@ -99,6 +107,6 @@ roll_live() {
 
 case "$TARGET" in
   staging) roll_staging ;;
-  claude | codex) roll_live ;;
-  *) die "target must be staging, claude or codex" ;;
+  claude | codex | gemini) roll_live ;;
+  *) die "target must be staging, claude, codex or gemini" ;;
 esac
