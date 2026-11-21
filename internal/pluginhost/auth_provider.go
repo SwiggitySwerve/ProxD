@@ -9,10 +9,12 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
+	baseauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -263,6 +265,15 @@ func (h *Host) SameAuthProvider(providerA, providerB string) bool {
 		}
 	}
 	return false
+}
+
+// AuthProviderPluginID returns the ID of the active plugin that owns provider as a login or
+// credential provider, with the same precedence as login dispatch; empty when none does.
+func (h *Host) AuthProviderPluginID(provider string) string {
+	if record := h.authProviderRecord(provider); record != nil {
+		return record.id
+	}
+	return ""
 }
 
 func (h *Host) authProviderRecord(provider string) *capabilityRecord {
@@ -1202,10 +1213,40 @@ type pluginTokenStorage struct {
 	meta     map[string]any
 }
 
+// pluginTokenStorageMu guards rawJSON and meta of every pluginTokenStorage: saves call SetMetadata
+// while executors and quota fetch read RawJSON from the same published record. It lives outside
+// the struct because the watcher compares Auths, storage included, with reflect.DeepEqual, and a
+// held lock must not make an unchanged credential look modified. Both fields are replaced, never
+// mutated in place.
+var pluginTokenStorageMu sync.RWMutex
+
+func (s *pluginTokenStorage) readLock() func() {
+	pluginTokenStorageMu.RLock()
+	return pluginTokenStorageMu.RUnlock
+}
+
+// snapshot returns the current raw payload and metadata; callers must not modify them.
+func (s *pluginTokenStorage) snapshot() ([]byte, map[string]any) {
+	defer s.readLock()()
+	return s.rawJSON, s.meta
+}
+
+// ComparableSnapshot returns a copy of this storage read under its lock, so equality checks
+// (the watcher's authEqual) never read fields a concurrent SetMetadata replaces.
+func (s *pluginTokenStorage) ComparableSnapshot() baseauth.TokenStorage {
+	if s == nil {
+		return nil
+	}
+	raw, meta := s.snapshot()
+	return &pluginTokenStorage{provider: s.provider, rawJSON: raw, meta: meta}
+}
+
 func (s *pluginTokenStorage) SetMetadata(meta map[string]any) {
 	if s == nil {
 		return
 	}
+	pluginTokenStorageMu.Lock()
+	defer pluginTokenStorageMu.Unlock()
 	if _, hadPriority := s.meta["priority"]; hadPriority {
 		if _, hasPriority := meta["priority"]; !hasPriority {
 			var raw map[string]any
@@ -1224,7 +1265,8 @@ func (s *pluginTokenStorage) RawJSON() []byte {
 	if s == nil {
 		return nil
 	}
-	payload, errPayload := mergedStorageJSON(s.rawJSON, s.meta, s.provider)
+	raw, meta := s.snapshot()
+	payload, errPayload := mergedStorageJSON(raw, meta, s.provider)
 	if errPayload != nil {
 		return nil
 	}
@@ -1235,7 +1277,8 @@ func (s *pluginTokenStorage) SaveTokenToFile(path string) error {
 	if s == nil {
 		return fmt.Errorf("plugin token storage is nil")
 	}
-	payload, errPayload := mergedStorageJSON(s.rawJSON, s.meta, s.provider)
+	raw, meta := s.snapshot()
+	payload, errPayload := mergedStorageJSON(raw, meta, s.provider)
 	if errPayload != nil {
 		return errPayload
 	}

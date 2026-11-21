@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	baseauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -598,11 +599,35 @@ func (w *Watcher) stopDispatch() {
 	w.clientsMutex.Unlock()
 }
 
+// comparableStorage is credential storage that saves change under its own lock (plugin storage).
+type comparableStorage interface {
+	ComparableSnapshot() baseauth.TokenStorage
+}
+
 func authEqual(a, b *coreauth.Auth) bool {
 	if a != nil && b != nil && a.HasFileSnapshot() && b.HasFileSnapshot() && !a.SameFileSnapshot(b) {
 		return false
 	}
-	return reflect.DeepEqual(normalizeAuth(a), normalizeAuth(b))
+	na, nb := normalizeAuth(a), normalizeAuth(b)
+	// Compare copies of such storage read under its lock, and take one copy when both
+	// credentials share the storage, so a save between two reads cannot look like a change.
+	var shared comparableStorage
+	if na != nil {
+		if storage, ok := na.Storage.(comparableStorage); ok {
+			shared = storage
+			na.Storage = storage.ComparableSnapshot()
+		}
+	}
+	if nb != nil {
+		if storage, ok := nb.Storage.(comparableStorage); ok {
+			if storage == shared {
+				nb.Storage = na.Storage
+			} else {
+				nb.Storage = storage.ComparableSnapshot()
+			}
+		}
+	}
+	return reflect.DeepEqual(na, nb)
 }
 
 func normalizeAuth(a *coreauth.Auth) *coreauth.Auth {

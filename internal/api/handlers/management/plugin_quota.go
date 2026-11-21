@@ -1,6 +1,8 @@
 package management
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -13,6 +15,7 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -55,6 +58,80 @@ func (h *Handler) GetQuotaProviders(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"providers": host.QuotaProviders(c.Request.Context())})
+}
+
+const (
+	quotaFetchV8RequestLimit  = 64 << 10
+	quotaFetchV8ResponseLimit = 1 << 20
+	quotaFetchV8Timeout       = 30 * time.Second
+)
+
+// FetchCredentialQuotaV8 retrieves normalized quota for a credential via its host-resolved
+// quota plugin only. Caller-supplied plugin_id overrides that do not match the host-resolved
+// plugin are rejected, and declarative quota_probe metadata is excluded from v8 collection.
+// Request and response bodies are size-capped, the plugin call has a deadline, and the host
+// bounds how many of these calls run at once.
+func (h *Handler) FetchCredentialQuotaV8(c *gin.Context) {
+	// Read the whole body inside the cap, so an oversized body is refused even when it starts
+	// with a valid object.
+	rawBody, errRead := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, quotaFetchV8RequestLimit))
+	if errRead != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(errRead, &maxBytesErr) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body too large"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	var body credentialQuotaRequest
+	if errUnmarshal := json.Unmarshal(rawBody, &body); errUnmarshal != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	authIndex := body.resolveAuthIndex()
+	if authIndex == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "auth_index is required"})
+		return
+	}
+
+	auth := h.authByIndex(authIndex)
+	if auth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth not found"})
+		return
+	}
+
+	h.mu.Lock()
+	host := h.pluginHost
+	h.mu.Unlock()
+	if host == nil {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "no quota provider available for credential"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), quotaFetchV8Timeout)
+	defer cancel()
+	quotaResp, handled, errFetch := host.FetchQuotaForCredential(ctx, auth.Provider, body.PluginID, auth.Index, auth.ID)
+	if !handled {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "no quota provider available for credential"})
+		return
+	}
+	if errors.Is(errFetch, pluginhost.ErrQuotaPluginMismatch) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "quota plugin does not match credential provider"})
+		return
+	}
+	if errFetch != nil {
+		log.WithError(errFetch).Warnf("failed to fetch v8 quota for credential %s", auth.Index)
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to fetch quota: %v", errFetch)})
+		return
+	}
+	payload, errMarshal := json.Marshal(quotaResp)
+	if errMarshal != nil || len(payload) > quotaFetchV8ResponseLimit {
+		log.Warnf("v8 quota response for credential %s is invalid or larger than %d bytes", auth.Index, quotaFetchV8ResponseLimit)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "invalid quota response"})
+		return
+	}
+	c.Data(http.StatusOK, "application/json; charset=utf-8", payload)
 }
 
 // FetchCredentialQuota retrieves normalized quota for a credential via its quota provider or declarative probe.

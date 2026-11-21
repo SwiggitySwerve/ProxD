@@ -1027,6 +1027,11 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	if record == nil {
 		return "", fmt.Errorf("token record is nil")
 	}
+	// Every OAuth login (v0 or v8, built-in or plugin) and every import persists through here, so
+	// the allowlist is rechecked now: a session started before its provider was removed cannot save.
+	if errAccepted := h.checkAcceptedAuth(record); errAccepted != nil {
+		return "", errAccepted
+	}
 	h.mergeExistingAuthFileMetadata(record)
 	store := h.tokenStoreWithBaseDir()
 	if store == nil {

@@ -493,12 +493,17 @@ func (h *Host) StaticAppendModelsForProvider(provider string) []*registry.ModelI
 }
 
 func (h *Host) HasExecutorCandidateProvider(provider string) bool {
+	return h.ExecutorPluginID(provider) != ""
+}
+
+// ExecutorPluginID returns the ID of the first active plugin whose executor serves provider.
+func (h *Host) ExecutorPluginID(provider string) string {
 	if h == nil {
-		return false
+		return ""
 	}
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	if provider == "" {
-		return false
+		return ""
 	}
 	for _, record := range h.activeRecords() {
 		executor := record.plugin.Capabilities.Executor
@@ -507,15 +512,15 @@ func (h *Host) HasExecutorCandidateProvider(provider string) bool {
 		}
 		candidate, okCandidate := h.executorProvider(record, executor)
 		if okCandidate && candidate == provider {
-			return true
+			return record.id
 		}
 		for _, authID := range h.recordOAuthExecutorProviders(record) {
 			if authID == provider {
-				return true
+				return record.id
 			}
 		}
 	}
-	return false
+	return ""
 }
 
 // OwnsExecutor reports whether executor is an adapter managed by this host.
