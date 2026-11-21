@@ -37,8 +37,8 @@ case "${ARGS[1]}" in */*) IMAGE=${ARGS[1]} ;; *) IMAGE="$IMAGE_REPO:${ARGS[1]}" 
 
 record_rollback() { # record_rollback <dir> <target> <previous-image>
   mkdir -p "$1"
-  local f
-  f="$1/$2-$(date -u +%Y%m%dT%H%M%SZ).txt"
+  local f # unique: a rollback can follow a failed restart within the same second
+  f=$(mktemp --suffix=.txt "$1/$2-$(date -u +%Y%m%dT%H%M%SZ)-XXXX")
   printf 'target=%s\nprevious_image=%s\nnew_image=%s\n' "$2" "$3" "$IMAGE" > "$f"
   echo "rollback record: $f"
 }

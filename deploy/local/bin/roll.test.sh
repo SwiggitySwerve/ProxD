@@ -65,6 +65,7 @@ EOF
 cat >"$T/stub/systemctl" <<'EOF'
 #!/usr/bin/env bash
 echo "systemctl $*" >>"$STUB/calls"
+[ "$2" != restart ] || [ ! -f "$STUB/restart-fails" ] || exit 1
 case "$*" in
   "--user list-timers --all --output=json") cat "$STUB/timers.json" ;;
   "--user is-active "*) if [ -f "$STUB/active-$3" ]; then cat "$STUB/active-$3"; else echo inactive; exit 3; fi ;;
@@ -75,7 +76,7 @@ cat >"$T/stub/podman" <<'EOF'
 echo "podman $*" >>"$STUB/calls"
 case "$1 $2 $3" in
   "image exists "*) [ "$3" != localhost/proxd:missing ] ;;
-  "image inspect --format") echo "id-$5" ;;
+  "image inspect --format") [ "$5" != localhost/proxd:missing ] && echo "id-$5" ;;
   "inspect --format {{.ImageName}}") echo localhost/cli-proxy-api:legacy-alias ;;
   "inspect --format {{.Image}}") # the container runs its quadlet's image, unless rebuilt
     if [ -f "$STUB/rebuilt" ]; then echo id-older-build; else echo "id-$(sed -n 's/^Image=//p' "$LIVE_UNIT_DIR/$4.container")"; fi ;;
@@ -153,6 +154,12 @@ check "roll.sh gemini restarts proxd-gemini only" [ "$(restarts)" = "restart pro
 rec=$(ls "$T/data/gemini/rollback/"gemini-*.txt 2>/dev/null || echo /nonexistent)
 check "roll.sh gemini records the quadlet's previous Image=" grep -qx "previous_image=$OLD" "$rec"
 check "roll.sh writes no record to the staging data dir" [ ! -e "$T/proxd-staging" ]
+touch "$T/restart-fails"
+"$BIN/roll.sh" --approved codex "$NEW" >/dev/null 2>&1 || true
+"$BIN/roll.sh" --approved codex "$OLD" >/dev/null 2>&1 || true
+rm "$T/restart-fails"
+check "roll.sh keeps both records when a rollback follows a failed restart at once" \
+  [ "$(ls "$T/data/codex/rollback/" | wc -l)" = 2 ]
 check "roll.sh gemini prints the rollback command" grep -qF "rollback: $BIN/roll.sh gemini $OLD --approved" <<<"$out"
 
 # --- nightly windows ---------------------------------------------------------
@@ -229,7 +236,7 @@ sed -i "s|^Image=.*|Image=localhost/proxd:missing|" "$T/units/proxd-gemini.conta
 "$BIN/roll-all.sh" --approved "$NEW" >"$T/out" 2>&1 && bad "roll-all refuses when a current image is gone" ||
   ok "roll-all refuses when a current image is gone"
 check "roll-all with a current image gone restarted nothing" [ -z "$(restarts)" ]
-check "roll-all says which image is gone" has "$T/out" "proxd-gemini's current image localhost/proxd:missing is not present"
+check "roll-all says which image is gone" has "$T/out" "its quadlet's localhost/proxd:missing is not present locally"
 
 reset_units
 timers
@@ -237,7 +244,13 @@ sed -i "s|^Image=.*|Image=$NEW|" "$T/units/proxd-codex.container"
 touch "$T/rebuilt"
 "$BIN/roll-all.sh" --approved "$NEW" >"$T/out" 2>&1 && bad "roll-all refuses a rebuilt tag" || ok "roll-all refuses a rebuilt tag"
 check "roll-all with a rebuilt tag restarted nothing" [ -z "$(restarts)" ]
-check "roll-all says the tag was rebuilt" has "$T/out" "was the tag rebuilt?"
+check "roll-all says the tag was rebuilt" has "$T/out" "proxd-codex runs image id-older-build but its quadlet's"
+
+reset_units
+timers
+touch "$T/rebuilt" # every hub still on $OLD, but $OLD now names a newer build
+"$BIN/roll-all.sh" --approved "$NEW" >"$T/out" 2>&1 && bad "roll-all refuses a rebuilt current tag" || ok "roll-all refuses a rebuilt current tag"
+check "roll-all with a rebuilt current tag restarted nothing" [ -z "$(restarts)" ]
 
 reset_units
 timers

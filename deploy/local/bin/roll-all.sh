@@ -258,16 +258,14 @@ main() {
   flock -n 8 || die "another roll-all.sh run holds $DATA_ROOT/roll-all/lock"
   read_quadlets # again, under the lock: a run that just finished may have changed them
   podman image exists "$IMAGE" || die "image $IMAGE not found locally; refusing to roll"
-  local hub running_id
+  local hub running_id quadlet_id
+  # Each hub must run exactly the image its quadlet names: that is what the skip trusts and
+  # what a rollback restores. A tag rebuilt or removed since the hub started cannot be.
   for hub in $HUBS; do
-    if [ "${PREV[$hub]}" = "$IMAGE" ]; then
-      # Skipped below, so it must really run this image, not an older build of the same tag.
-      running_id=$(podman inspect --format '{{.Image}}' "proxd-$hub" 2>/dev/null || true)
-      [ "$running_id" = "$(podman image inspect --format '{{.Id}}' "$IMAGE")" ] ||
-        die "proxd-$hub's quadlet names $IMAGE but its container runs another image (was the tag rebuilt?); roll a new tag"
-    else
-      podman image exists "${PREV[$hub]}" || die "proxd-$hub's current image ${PREV[$hub]} is not present locally, so it could not be rolled back; refusing to roll"
-    fi
+    running_id=$(podman inspect --format '{{.Image}}' "proxd-$hub" 2>/dev/null || true)
+    quadlet_id=$(podman image inspect --format '{{.Id}}' "${PREV[$hub]}" 2>/dev/null || true)
+    [ -n "$running_id" ] && [ "$running_id" = "$quadlet_id" ] ||
+      die "proxd-$hub runs image ${running_id:-<none>} but its quadlet's ${PREV[$hub]} is ${quadlet_id:-not present locally} (tag rebuilt or removed?); a rollback could not restore it, refusing to roll"
   done
   # The check after each roll cannot pass if a source is down before it: refuse instead
   # of rolling back a healthy hub.
