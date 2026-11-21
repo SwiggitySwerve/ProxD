@@ -673,7 +673,7 @@ func TestProviderCatalogBuiltinMatchesProxUIGolden(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 	// Entry copied from ProxUI tests/fixtures/providerCatalog/catalog.golden.json.
-	const golden = `{"id":"antigravity","display_name":"Gemini / Antigravity","source":"builtin","plugin_id":null,"logo":null,"lifecycle":"active","credentials":{"total":1,"active":1,"disabled":0,"problem":0},"oauth":{"flow":"browser","aliases":[],"manual_callback":true,"webui":true,"domains":[]},"quota":{"supported":true,"reader":"builtin","plugin_id":null,"supports_reset":false}}`
+	const golden = `{"id":"antigravity","display_name":"Antigravity","source":"builtin","plugin_id":null,"logo":null,"lifecycle":"active","credentials":{"total":1,"active":1,"disabled":0,"problem":0},"oauth":{"flow":"browser","aliases":[],"manual_callback":true,"webui":true,"domains":[]},"quota":{"supported":true,"reader":"builtin","plugin_id":null,"supports_reset":false}}`
 	var want map[string]any
 	if err := json.Unmarshal([]byte(golden), &want); err != nil {
 		t.Fatalf("decode golden: %v", err)
