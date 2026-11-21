@@ -1824,6 +1824,12 @@ func (h *Handler) savePluginLoginRecords(ctx context.Context, records []*coreaut
 		h.pluginLoginSaveMu.Lock()
 		defer h.pluginLoginSaveMu.Unlock()
 	}
+	// Refuse the whole login before the first write; saveTokenRecord still rechecks each record.
+	for _, record := range records {
+		if errAccepted := h.checkAcceptedAuth(record); errAccepted != nil {
+			return errAccepted
+		}
+	}
 	rollbacks := make([]savedPluginRecordRollback, 0, len(records))
 	for _, record := range records {
 		var rb savedPluginRecordRollback

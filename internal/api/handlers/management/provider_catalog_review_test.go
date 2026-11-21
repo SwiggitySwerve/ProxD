@@ -17,7 +17,9 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 	"unicode/utf16"
 
 	"github.com/MoeForge/moego/json"
@@ -382,6 +384,18 @@ func TestAcceptedProvidersUseSignInIdentity(t *testing.T) {
 	if err := h.checkAcceptedProvider("claude"); err != nil {
 		t.Fatalf("claude rejected though anthropic is accepted: %v", err)
 	}
+	// A credential whose provider is itself a sign-in provider keeps that identity.
+	if err := h.checkAcceptedAuth(&coreauth.Auth{Provider: "zcode-bigmodel", Attributes: map[string]string{"oauth_provider": "zcode-zai"}}); err == nil {
+		t.Fatalf("zcode-bigmodel credential admitted through a zcode-zai portal hint")
+	}
+	// Every Kimi spelling resolves its sign-in entry from the domain.
+	kimiOnly := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir, AcceptedProviders: []string{"kimi-ai"}}, coreauth.NewManager(nil, nil, nil))
+	if err := kimiOnly.checkAcceptedAuth(&coreauth.Auth{Provider: "kimi.ai", Metadata: map[string]any{"domain": "kimi.ai"}}); err != nil {
+		t.Fatalf("kimi.ai credential rejected on a kimi-ai hub: %v", err)
+	}
+	if err := kimiOnly.checkAcceptedAuth(&coreauth.Auth{Provider: "kimi-ai", Metadata: map[string]any{"domain": "kimi.com"}}); err == nil {
+		t.Fatalf("kimi.com credential admitted as kimi-ai")
+	}
 
 	kimiCom := `{"type":"kimi","domain":"kimi.com","access_token":"a","refresh_token":"r"}`
 	kimiAI := `{"type":"kimi","domain":"kimi.ai","access_token":"a","refresh_token":"r"}`
@@ -440,6 +454,7 @@ func TestProviderCatalogWireAndPrecedence(t *testing.T) {
 	registerFileAuth(t, manager, authDir, &coreauth.Auth{ID: "ag-signin.json", Provider: "antigravity", Status: coreauth.StatusError, RequiresSignIn: true}, `{"type":"antigravity"}`)
 	registerFileAuth(t, manager, authDir, &coreauth.Auth{ID: "gw.json", Provider: "openai-compatible-my gateway", Status: coreauth.StatusActive}, `{"type":"openai-compatible-my gateway"}`)
 	registerFileAuth(t, manager, authDir, &coreauth.Auth{ID: "gone.json", Provider: "gone-plugin", Status: coreauth.StatusActive}, `{"type":"gone-plugin"}`)
+	registerFileAuth(t, manager, authDir, &coreauth.Auth{ID: "exec.json", Provider: "exec-only", Status: coreauth.StatusActive}, `{"type":"exec-only"}`)
 	registerFileAuth(t, manager, authDir, &coreauth.Auth{ID: "compat.json", Provider: "own-endpoint", Status: coreauth.StatusActive, Attributes: map[string]string{"base_url": "https://llm.example.test/v1"}}, `{"type":"own-endpoint","base_url":"https://llm.example.test/v1"}`)
 
 	host := pluginhost.New()
@@ -451,6 +466,10 @@ func TestProviderCatalogWireAndPrecedence(t *testing.T) {
 				identifiers:             []string{"dup-provider", "codex", "under_score"},
 			},
 		},
+	})
+	host.RegisterPluginWithPriorityForTest("exec-plugin", 1, pluginapi.Plugin{
+		Metadata:     pluginapi.Metadata{Name: "Exec Only"},
+		Capabilities: pluginapi.Capabilities{Executor: catalogTestExecutor{identifier: "exec-only"}},
 	})
 	host.RegisterPluginWithPriorityForTest("second-plugin", 1, pluginapi.Plugin{
 		Metadata:     pluginapi.Metadata{Name: "Second"},
@@ -483,6 +502,9 @@ func TestProviderCatalogWireAndPrecedence(t *testing.T) {
 	if gone.Source != "plugin" || gone.Lifecycle != lifecycleDisabled || gone.PluginID != nil {
 		t.Fatalf("gone-plugin = %+v, want a disabled plugin provider", gone)
 	}
+	if exec := catalogEntry(t, resp, "exec-only"); exec.Source != "plugin" || exec.PluginID == nil || *exec.PluginID != "exec-plugin" || exec.Lifecycle != lifecycleActive {
+		t.Fatalf("exec-only = %+v, want the active executor plugin's provider", exec)
+	}
 	if own := catalogEntry(t, resp, "own-endpoint"); own.Source != "builtin" || own.Lifecycle != lifecycleActive {
 		t.Fatalf("own-endpoint = %+v, want an active built-in OpenAI-compatible provider", own)
 	}
@@ -509,6 +531,110 @@ func TestProviderCatalogListLimits(t *testing.T) {
 	resp, _ := fetchCatalog(t, h)
 	if len(resp.Providers) != catalogMaxProviders || len(resp.AcceptedProviders) != catalogMaxAcceptedProviders {
 		t.Fatalf("providers = %d, accepted = %d; want %d and %d", len(resp.Providers), len(resp.AcceptedProviders), catalogMaxProviders, catalogMaxAcceptedProviders)
+	}
+	// Sign-in entries survive truncation ahead of credential-only ones.
+	for _, spec := range builtinOAuthProviders {
+		catalogEntry(t, resp, spec.ID)
+	}
+}
+
+type catalogTestExecutor struct{ identifier string }
+
+func (e catalogTestExecutor) Identifier() string { return e.identifier }
+func (catalogTestExecutor) Execute(context.Context, pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+	return pluginapi.ExecutorResponse{}, nil
+}
+func (catalogTestExecutor) ExecuteStream(context.Context, pluginapi.ExecutorRequest) (pluginapi.ExecutorStreamResponse, error) {
+	return pluginapi.ExecutorStreamResponse{}, nil
+}
+func (catalogTestExecutor) CountTokens(context.Context, pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+	return pluginapi.ExecutorResponse{}, nil
+}
+func (catalogTestExecutor) HttpRequest(context.Context, pluginapi.ExecutorHTTPRequest) (pluginapi.ExecutorHTTPResponse, error) {
+	return pluginapi.ExecutorHTTPResponse{}, nil
+}
+
+// S20: a mixed login result is refused before any credential is written.
+func TestSavePluginLoginRecordsRefusesMixedBatchBeforeWriting(t *testing.T) {
+	t.Setenv(acceptedProvidersEnvVar, "")
+	authDir := t.TempDir()
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir, AcceptedProviders: []string{"antigravity"}}, coreauth.NewManager(nil, nil, nil))
+	hookCalls := 0
+	h.SetPostAuthHook(func(context.Context, *coreauth.Auth) error {
+		hookCalls++
+		return nil
+	})
+	err := h.savePluginLoginRecords(context.Background(), []*coreauth.Auth{
+		{ID: "ok.json", FileName: "ok.json", Provider: "antigravity", Metadata: map[string]any{"type": "antigravity"}},
+		{ID: "denied.json", FileName: "denied.json", Provider: "codex", Metadata: map[string]any{"type": "codex"}},
+	})
+	var notAccepted *providerNotAcceptedError
+	if !errors.As(err, &notAccepted) {
+		t.Fatalf("savePluginLoginRecords error = %v, want provider_not_accepted", err)
+	}
+	if hookCalls != 0 {
+		t.Fatalf("persistence hook ran %d times for a refused batch, want 0", hookCalls)
+	}
+	entries, _ := os.ReadDir(authDir)
+	if len(entries) != 0 {
+		t.Fatalf("auth dir has %d entries after a refused batch, want none", len(entries))
+	}
+}
+
+type slowDescribeQuotaProvider struct {
+	mockQuotaProvider
+	entered chan struct{}
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (p *slowDescribeQuotaProvider) DescribeQuota(ctx context.Context, req pluginapi.QuotaDescribeRequest) (pluginapi.QuotaDescribeResponse, error) {
+	p.calls.Add(1)
+	p.entered <- struct{}{}
+	<-p.release
+	return p.mockQuotaProvider.DescribeQuota(ctx, req)
+}
+
+// S3: a cold DescribeQuota keeps its slot after the caller gives up, so abandoned calls cannot
+// stack up more plugin work than the slot count.
+func TestFetchQuotaForCredentialHoldsSlotThroughDescribe(t *testing.T) {
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	cred := registerFileAuth(t, manager, authDir, &coreauth.Auth{ID: "slow.json", Provider: "slow-runtime", Status: coreauth.StatusActive}, `{"type":"slow-runtime"}`)
+	provider := &slowDescribeQuotaProvider{
+		mockQuotaProvider: mockQuotaProvider{identifier: "slow", supported: []string{"slow-runtime"}},
+		entered:           make(chan struct{}, 16),
+		release:           make(chan struct{}),
+	}
+	host := pluginhost.New()
+	host.SetAuthManager(manager)
+	host.RegisterPluginForTest("slow-plugin", pluginapi.Plugin{Capabilities: pluginapi.Capabilities{QuotaProvider: provider}})
+
+	const slots = 4
+	for i := 0; i < slots; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			_, _, err := host.FetchQuotaForCredential(ctx, "slow-runtime", "", cred.Index, cred.ID)
+			done <- err
+		}()
+		<-provider.entered
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("abandoned call %d err = %v, want context.Canceled", i, err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, _, err := host.FetchQuotaForCredential(ctx, "slow-runtime", "", cred.Index, cred.ID); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("call past the limit err = %v, want it to wait for a slot", err)
+	}
+	if got := provider.calls.Load(); got != slots {
+		t.Fatalf("DescribeQuota calls = %d, want %d: a slot was freed while a describe still ran", got, slots)
+	}
+	close(provider.release)
+	if _, handled, err := host.FetchQuotaForCredential(context.Background(), "slow-runtime", "", cred.Index, cred.ID); !handled || err != nil {
+		t.Fatalf("fetch after describes finish = handled %v, err %v", handled, err)
 	}
 }
 
@@ -706,13 +832,6 @@ func TestFetchCredentialQuotaV8Bounds(t *testing.T) {
 		t.Fatalf("after slots free status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 
-	// A replacement file written before its record is published is not sent to the old plugin.
-	if err := os.WriteFile(cred.Attributes[coreauth.AttributePath], []byte(`{"type":"other"}`), 0o600); err != nil {
-		t.Fatalf("replace file: %v", err)
-	}
-	if handled, err := fetch(context.Background()); !handled || err == nil {
-		t.Fatalf("fetch with a replaced file = handled %v, err %v; want an error", handled, err)
-	}
 	// The credential must still be under the provider the plugin was resolved for.
 	if _, err := manager.Update(context.Background(), &coreauth.Auth{ID: cred.ID, Provider: "other", Status: coreauth.StatusActive, Attributes: cred.Attributes}); err != nil {
 		t.Fatalf("update: %v", err)

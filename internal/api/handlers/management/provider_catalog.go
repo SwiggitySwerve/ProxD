@@ -301,26 +301,32 @@ func (h *Handler) effectiveAcceptedProviders() []string {
 
 // signInProviderID is the one provider identity used for admission: the sign-in provider that
 // StartOAuthV8 takes and the catalog lists as a sign-in entry (a plugin portal, or kimi vs kimi-ai
-// by domain), with built-in aliases folded. A portal hint from the credential counts only when
-// the plugin owning that portal also owns the credential's provider; otherwise the credential's
-// own provider is its identity.
+// by domain), with built-in aliases folded. A credential whose provider is itself a sign-in
+// provider keeps it. Otherwise a portal hint counts only when the plugin owning that portal also
+// owns the credential's provider; failing that, the credential's own provider is its identity.
 func (h *Handler) signInProviderID(auth *coreauth.Auth) string {
 	if auth == nil {
 		return ""
 	}
 	runtimeID := canonicalBuiltinProviderKey(auth.Provider)
-	signInID := canonicalBuiltinProviderKey(h.resolveTargetOAuthProvider(auth))
-	if signInID == runtimeID {
-		return signInID
-	}
-	if runtimeID == "kimi" && signInID == "kimi-ai" {
+	switch runtimeID {
+	case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
 		// Built-in Kimi picks its sign-in entry from the credential's domain.
-		return signInID
+		return canonicalBuiltinProviderKey(h.resolveTargetOAuthProvider(auth))
 	}
 	h.mu.Lock()
 	host := h.pluginHost
 	h.mu.Unlock()
-	if host != nil && host.SameAuthProvider(signInID, auth.Provider) {
+	if host == nil {
+		return runtimeID
+	}
+	for _, loginID := range host.AuthProviderIdentifiers() {
+		if loginID == runtimeID {
+			return runtimeID
+		}
+	}
+	signInID := canonicalBuiltinProviderKey(h.resolveTargetOAuthProvider(auth))
+	if signInID != runtimeID && host.SameAuthProvider(signInID, auth.Provider) {
 		return signInID
 	}
 	return runtimeID
@@ -734,6 +740,9 @@ func (h *Handler) GetProviderCatalogV8(c *gin.Context) {
 			if ownerPluginID == "" {
 				ownerPluginID = quotaPluginIDs[providerID]
 			}
+			if ownerPluginID == "" {
+				ownerPluginID = host.ExecutorPluginID(providerID)
+			}
 		}
 		if ownerPluginID != "" {
 			entry.Source = "plugin"
@@ -754,11 +763,20 @@ func (h *Handler) GetProviderCatalogV8(c *gin.Context) {
 			ids = append(ids, id)
 		}
 	}
-	sort.Strings(ids)
 	if len(ids) > catalogMaxProviders {
+		// Keep sign-in and quota-capable providers before credential-only ones.
+		capable := func(entry providerCatalogEntry) bool { return entry.OAuth != nil || entry.Quota.Supported }
+		sort.Slice(ids, func(i, j int) bool {
+			ci, cj := capable(entriesByID[ids[i]]), capable(entriesByID[ids[j]])
+			if ci != cj {
+				return ci
+			}
+			return ids[i] < ids[j]
+		})
 		log.Warnf("provider catalog truncated to %d of %d providers", catalogMaxProviders, len(ids))
 		ids = ids[:catalogMaxProviders]
 	}
+	sort.Strings(ids)
 
 	providers := make([]providerCatalogEntry, 0, len(ids))
 	for _, id := range ids {

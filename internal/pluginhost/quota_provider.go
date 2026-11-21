@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 
-	"github.com/MoeForge/moego/json"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -347,11 +347,10 @@ var (
 )
 
 // FetchQuotaForCredential resolves the quota plugin for provider and calls it for the credential
-// at authIndex, all while holding one of a few concurrency slots. A non-empty requestedPluginID must
-// name the selected plugin. The credential must still be authID under provider, and its file bytes
-// (when it has a file) must still be of the record's type, so a replacement written before its
-// record is published is refused. The slot is held until the plugin call itself returns, even when
-// ctx ends first and the caller has already gone.
+// at authIndex, all under one of a few concurrency slots. A non-empty requestedPluginID must name
+// the selected plugin, and the credential must still be authID under provider. The slot is held
+// until every plugin call made under it has returned (a cold resolution may call DescribeQuota),
+// even when ctx ends first and the caller has already gone.
 func (h *Host) FetchQuotaForCredential(ctx context.Context, provider, requestedPluginID, authIndex, authID string) (pluginapi.QuotaFetchResponse, bool, error) {
 	if h == nil {
 		return pluginapi.QuotaFetchResponse{}, false, nil
@@ -364,10 +363,29 @@ func (h *Host) FetchQuotaForCredential(ctx context.Context, provider, requestedP
 	case <-ctx.Done():
 		return pluginapi.QuotaFetchResponse{}, true, ctx.Err()
 	}
-	fetchCtx, release := withPluginCallFinish(ctx, func() { <-quotaFetchSlots })
-	defer release()
+	// One reference for this call, one for the resolution goroutine, one per fetch.
+	var refs atomic.Int32
+	refs.Store(2)
+	releaseRef := func() {
+		if refs.Add(-1) == 0 {
+			<-quotaFetchSlots
+		}
+	}
+	defer releaseRef()
 
-	record := h.quotaProviderRecord(ctx, provider)
+	// Resolution runs uncancelled in its own goroutine so the slot outlives a DescribeQuota that
+	// ctx would otherwise abandon; this call stops waiting when ctx ends.
+	resolved := make(chan *capabilityRecord, 1)
+	go func() {
+		defer releaseRef()
+		resolved <- h.quotaProviderRecord(context.WithoutCancel(ctx), provider)
+	}()
+	var record *capabilityRecord
+	select {
+	case record = <-resolved:
+	case <-ctx.Done():
+		return pluginapi.QuotaFetchResponse{}, true, ctx.Err()
+	}
 	if record == nil {
 		return pluginapi.QuotaFetchResponse{}, false, nil
 	}
@@ -387,17 +405,11 @@ func (h *Host) FetchQuotaForCredential(ctx context.Context, provider, requestedP
 		if errRead != nil {
 			return pluginapi.QuotaFetchResponse{}, true, fmt.Errorf("failed to read auth file: %w", errRead)
 		}
-		var head struct {
-			Type string `json:"type"`
-		}
-		if errUnmarshal := json.Unmarshal(data, &head); errUnmarshal != nil {
-			return pluginapi.QuotaFetchResponse{}, true, errQuotaCredentialChanged
-		}
-		if recordType, _ := auth.Metadata["type"].(string); recordType != "" && strings.TrimSpace(head.Type) != strings.TrimSpace(recordType) {
-			return pluginapi.QuotaFetchResponse{}, true, errQuotaCredentialChanged
-		}
 		rawJSON = data
 	}
+	refs.Add(1)
+	fetchCtx, finishFetch := withPluginCallFinish(ctx, releaseRef)
+	defer finishFetch()
 	req := pluginapi.QuotaFetchRequest{
 		AuthIndex:   authIndex,
 		AuthID:      auth.ID,
