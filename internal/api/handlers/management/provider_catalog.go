@@ -3,16 +3,18 @@ package management
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/MoeForge/moego/json"
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/kimi"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/htmlsanitize"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
@@ -86,104 +88,109 @@ type builtinOAuthProviderSpec struct {
 }
 
 // builtinOAuthProviders is the single source of truth shared by StartOAuthV8 and
-// GET /v8/management/providers.
-var builtinOAuthProviders = []builtinOAuthProviderSpec{
-	{
-		ID:             "claude",
-		DisplayName:    "Claude",
-		Flow:           "browser",
-		Aliases:        []string{"anthropic"},
-		ManualCallback: true,
-		WebUI:          true,
-		Domains:        []string{},
-		QuotaSupported: true,
-		SupportsReset:  true,
-		Start:          (*Handler).RequestAnthropicToken,
-	},
-	{
-		ID:             "codex",
-		DisplayName:    "Codex",
-		Flow:           "browser",
-		Aliases:        []string{},
-		ManualCallback: true,
-		WebUI:          true,
-		Domains:        []string{},
-		QuotaSupported: true,
-		SupportsReset:  true,
-		Start:          (*Handler).RequestCodexToken,
-	},
-	{
-		ID:             "antigravity",
-		DisplayName:    "Gemini / Antigravity",
-		Flow:           "browser",
-		Aliases:        []string{},
-		ManualCallback: true,
-		WebUI:          true,
-		Domains:        []string{},
-		QuotaSupported: true,
-		SupportsReset:  false,
-		Start:          (*Handler).RequestAntigravityToken,
-	},
-	{
-		ID:             "kimi",
-		DisplayName:    "Kimi (kimi.com)",
-		Flow:           "device",
-		Aliases:        []string{},
-		ManualCallback: false,
-		WebUI:          false,
-		Domains:        []string{"kimi.com"},
-		QuotaSupported: false,
-		SupportsReset:  false,
-		Start:          (*Handler).RequestKimiToken,
-	},
-	{
-		ID:             "kimi-ai",
-		DisplayName:    "Kimi (kimi.ai)",
-		Flow:           "device",
-		Aliases:        []string{},
-		ManualCallback: false,
-		WebUI:          false,
-		Domains:        []string{"kimi.ai"},
-		QuotaSupported: false,
-		SupportsReset:  false,
-		Start:          (*Handler).RequestKimiAIToken,
-	},
-	{
-		ID:             "xai",
-		DisplayName:    "xAI",
-		Flow:           "device",
-		Aliases:        []string{},
-		ManualCallback: false,
-		WebUI:          false,
-		Domains:        []string{},
-		QuotaSupported: false,
-		SupportsReset:  false,
-		Start:          (*Handler).RequestXAIToken,
-	},
-	{
-		ID:             "devin",
-		DisplayName:    "Devin",
-		Flow:           "browser",
-		Aliases:        []string{},
-		ManualCallback: true,
-		WebUI:          true,
-		Domains:        []string{},
-		QuotaSupported: false,
-		SupportsReset:  false,
-		Start:          (*Handler).RequestDevinToken,
-	},
-	{
-		ID:             "meta",
-		DisplayName:    "Meta",
-		Flow:           "device",
-		Aliases:        []string{},
-		ManualCallback: false,
-		WebUI:          false,
-		Domains:        []string{},
-		QuotaSupported: false,
-		SupportsReset:  false,
-		Start:          (*Handler).RequestMetaToken,
-	},
+// GET /v8/management/providers. It is filled in init because its Start handlers reach
+// saveTokenRecord, which reads this table through the allowlist check.
+var builtinOAuthProviders []builtinOAuthProviderSpec
+
+func init() {
+	builtinOAuthProviders = []builtinOAuthProviderSpec{
+		{
+			ID:             "claude",
+			DisplayName:    "Claude",
+			Flow:           "browser",
+			Aliases:        []string{"anthropic"},
+			ManualCallback: true,
+			WebUI:          true,
+			Domains:        []string{},
+			QuotaSupported: true,
+			SupportsReset:  true,
+			Start:          (*Handler).RequestAnthropicToken,
+		},
+		{
+			ID:             "codex",
+			DisplayName:    "Codex",
+			Flow:           "browser",
+			Aliases:        []string{},
+			ManualCallback: true,
+			WebUI:          true,
+			Domains:        []string{},
+			QuotaSupported: true,
+			SupportsReset:  true,
+			Start:          (*Handler).RequestCodexToken,
+		},
+		{
+			ID:             "antigravity",
+			DisplayName:    "Gemini / Antigravity",
+			Flow:           "browser",
+			Aliases:        []string{},
+			ManualCallback: true,
+			WebUI:          true,
+			Domains:        []string{},
+			QuotaSupported: true,
+			SupportsReset:  false,
+			Start:          (*Handler).RequestAntigravityToken,
+		},
+		{
+			ID:             "kimi",
+			DisplayName:    "Kimi (kimi.com)",
+			Flow:           "device",
+			Aliases:        []string{},
+			ManualCallback: false,
+			WebUI:          false,
+			Domains:        []string{"kimi.com"},
+			QuotaSupported: false,
+			SupportsReset:  false,
+			Start:          (*Handler).RequestKimiToken,
+		},
+		{
+			ID:             "kimi-ai",
+			DisplayName:    "Kimi (kimi.ai)",
+			Flow:           "device",
+			Aliases:        []string{},
+			ManualCallback: false,
+			WebUI:          false,
+			Domains:        []string{"kimi.ai"},
+			QuotaSupported: false,
+			SupportsReset:  false,
+			Start:          (*Handler).RequestKimiAIToken,
+		},
+		{
+			ID:             "xai",
+			DisplayName:    "xAI",
+			Flow:           "device",
+			Aliases:        []string{},
+			ManualCallback: false,
+			WebUI:          false,
+			Domains:        []string{},
+			QuotaSupported: false,
+			SupportsReset:  false,
+			Start:          (*Handler).RequestXAIToken,
+		},
+		{
+			ID:             "devin",
+			DisplayName:    "Devin",
+			Flow:           "browser",
+			Aliases:        []string{},
+			ManualCallback: true,
+			WebUI:          true,
+			Domains:        []string{},
+			QuotaSupported: false,
+			SupportsReset:  false,
+			Start:          (*Handler).RequestDevinToken,
+		},
+		{
+			ID:             "meta",
+			DisplayName:    "Meta",
+			Flow:           "device",
+			Aliases:        []string{},
+			ManualCallback: false,
+			WebUI:          false,
+			Domains:        []string{},
+			QuotaSupported: false,
+			SupportsReset:  false,
+			Start:          (*Handler).RequestMetaToken,
+		},
+	}
 }
 
 func findBuiltinOAuthProvider(provider string) (builtinOAuthProviderSpec, bool) {
@@ -245,6 +252,8 @@ func (e *providerNotAcceptedError) responseBody() gin.H {
 	}
 }
 
+// normalizeProviderList lowercases, trims and dedupes provider IDs and folds built-in aliases
+// (anthropic -> claude), so every entry is in the identity space signInProviderID uses.
 func normalizeProviderList(items []string) []string {
 	if len(items) == 0 {
 		return nil
@@ -252,7 +261,7 @@ func normalizeProviderList(items []string) []string {
 	out := make([]string, 0, len(items))
 	seen := make(map[string]struct{}, len(items))
 	for _, raw := range items {
-		id := strings.ToLower(strings.TrimSpace(raw))
+		id := canonicalBuiltinProviderKey(raw)
 		if id == "" {
 			continue
 		}
@@ -288,57 +297,46 @@ func (h *Handler) effectiveAcceptedProviders() []string {
 	return normalizeProviderList(cfg.AcceptedProviders)
 }
 
-func (h *Handler) providerMatchesAccepted(provider string, accepted []string, host *pluginhost.Host) bool {
-	if len(accepted) == 0 {
-		return true
-	}
-	trimmed := strings.ToLower(strings.TrimSpace(provider))
-	if trimmed == "" {
-		return false
-	}
-	canonical := canonicalBuiltinProviderKey(trimmed)
-	for _, allowed := range accepted {
-		if allowed == trimmed || canonicalBuiltinProviderKey(allowed) == canonical {
-			return true
-		}
-		if host != nil && host.SameAuthProvider(trimmed, allowed) {
-			return true
-		}
-	}
-	return false
+// signInProviderID is the one provider identity used for admission: the sign-in provider that
+// StartOAuthV8 takes and the catalog lists as a sign-in entry (a plugin portal, or kimi vs kimi-ai
+// by domain), with built-in aliases folded.
+func (h *Handler) signInProviderID(auth *coreauth.Auth) string {
+	return canonicalBuiltinProviderKey(h.resolveTargetOAuthProvider(auth))
 }
 
+// checkAcceptedProvider admits a sign-in provider ID only when it is listed exactly (after alias
+// folding); an unset allowlist admits everything.
 func (h *Handler) checkAcceptedProvider(provider string) error {
 	accepted := h.effectiveAcceptedProviders()
 	if len(accepted) == 0 {
 		return nil
 	}
-	var host *pluginhost.Host
-	if h != nil {
-		h.mu.Lock()
-		host = h.pluginHost
-		h.mu.Unlock()
-	}
-	trimmed := strings.ToLower(strings.TrimSpace(provider))
-	if h.providerMatchesAccepted(trimmed, accepted, host) {
-		return nil
+	id := canonicalBuiltinProviderKey(provider)
+	for _, allowed := range accepted {
+		if allowed == id {
+			return nil
+		}
 	}
 	return &providerNotAcceptedError{
-		Provider:          trimmed,
+		Provider:          id,
 		AcceptedProviders: accepted,
 	}
 }
 
+// checkAcceptedAuth admits a credential by its sign-in provider before it is persisted.
+func (h *Handler) checkAcceptedAuth(auth *coreauth.Auth) error {
+	if auth == nil {
+		return nil
+	}
+	return h.checkAcceptedProvider(h.signInProviderID(auth))
+}
+
 func (h *Handler) rejectIfProviderNotAccepted(c *gin.Context, provider string) bool {
-	errAccepted := h.checkAcceptedProvider(provider)
-	if errAccepted == nil {
+	var notAccepted *providerNotAcceptedError
+	if !errors.As(h.checkAcceptedProvider(provider), &notAccepted) {
 		return false
 	}
-	if notAccepted, ok := errAccepted.(*providerNotAcceptedError); ok {
-		c.JSON(http.StatusConflict, notAccepted.responseBody())
-		return true
-	}
-	c.JSON(http.StatusConflict, gin.H{"error": "provider_not_accepted", "provider": strings.ToLower(strings.TrimSpace(provider))})
+	c.JSON(http.StatusConflict, notAccepted.responseBody())
 	return true
 }
 
@@ -360,86 +358,33 @@ func credentialLifecycleAt(auth *coreauth.Auth, now time.Time) string {
 	return lifecycleActive
 }
 
+// deriveProviderLifecycle applies the roadmap rule: any credential needing attention wins over
+// healthy ones; disabled only when none is active.
 func deriveProviderLifecycle(creds providerCatalogCredentials) string {
-	if creds.Total == 0 {
+	switch {
+	case creds.Total == 0:
 		return lifecycleAwaitingAuth
-	}
-	if creds.Active > 0 {
-		return lifecycleActive
-	}
-	if creds.Problem > 0 {
+	case creds.Problem > 0:
 		return lifecycleNeedsAttention
-	}
-	if creds.Disabled > 0 {
+	case creds.Active > 0:
+		return lifecycleActive
+	default:
 		return lifecycleDisabled
 	}
-	return lifecycleAwaitingAuth
 }
 
-func (h *Handler) credentialCatalogProviderID(auth *coreauth.Auth, host *pluginhost.Host) string {
-	if auth == nil {
-		return ""
-	}
-	if host != nil {
-		for _, key := range []string{"oauth_provider", "portal"} {
-			if auth.Attributes != nil {
-				if candidate := strings.ToLower(strings.TrimSpace(auth.Attributes[key])); candidate != "" && host.HasAuthProvider(candidate) {
-					return candidate
-				}
-			}
-			if auth.Metadata != nil {
-				if raw, ok := auth.Metadata[key].(string); ok {
-					if candidate := strings.ToLower(strings.TrimSpace(raw)); candidate != "" && host.HasAuthProvider(candidate) {
-						return candidate
-					}
-				}
-			}
-		}
-	}
-	raw := strings.ToLower(strings.TrimSpace(auth.Provider))
-	switch raw {
-	case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
-		if kimi.IsKimiAIAuth(auth) {
-			return "kimi-ai"
-		}
-		return "kimi"
-	default:
-		return canonicalBuiltinProviderKey(raw)
-	}
-}
-
-func (h *Handler) collectProviderCredentialCounts(now time.Time, host *pluginhost.Host) map[string]providerCatalogCredentials {
+// collectProviderCredentialCounts counts each listable credential under its runtime provider (the
+// provider /credentials and quota fetch report) and, when it differs, under its sign-in provider
+// too, so sign-in entries and runtime entries both reflect the credentials they own.
+func (h *Handler) collectProviderCredentialCounts(now time.Time) map[string]providerCatalogCredentials {
 	counts := make(map[string]providerCatalogCredentials)
 	if h == nil || h.authManager == nil {
 		return counts
 	}
-	for _, auth := range h.authManager.List() {
-		if auth == nil {
-			continue
-		}
-		runtimeOnly := isRuntimeOnlyAuth(auth)
-		if runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled) {
-			continue
-		}
-		path := strings.TrimSpace(authAttribute(auth, "path"))
-		configKey := coreauth.IsConfigAPIKeyAuth(auth)
-		if path == "" && !runtimeOnly && !configKey {
-			continue
-		}
-		if path != "" {
-			if _, errStat := os.Stat(path); os.IsNotExist(errStat) {
-				if !runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api")) {
-					continue
-				}
-			}
-		}
-		providerID := h.credentialCatalogProviderID(auth, host)
-		if providerID == "" {
-			continue
-		}
+	add := func(providerID, lifecycle string) {
 		entry := counts[providerID]
 		entry.Total++
-		switch credentialLifecycleAt(auth, now) {
+		switch lifecycle {
 		case lifecycleDisabled:
 			entry.Disabled++
 		case lifecycleNeedsAttention:
@@ -449,7 +394,65 @@ func (h *Handler) collectProviderCredentialCounts(now time.Time, host *pluginhos
 		}
 		counts[providerID] = entry
 	}
+	for _, auth := range h.authManager.List() {
+		if !isAuthFileListable(auth, true) {
+			continue
+		}
+		runtimeID := canonicalBuiltinProviderKey(auth.Provider)
+		if runtimeID == "" {
+			continue
+		}
+		lifecycle := credentialLifecycleAt(auth, now)
+		add(runtimeID, lifecycle)
+		if signInID := h.signInProviderID(auth); signInID != "" && signInID != runtimeID {
+			add(signInID, lifecycle)
+		}
+	}
 	return counts
+}
+
+var catalogProviderIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+
+// catalogDisplayNameMaxUnits is ProxUI's display_name cap, counted in UTF-16 code units.
+const catalogDisplayNameMaxUnits = 128
+
+func isCatalogWhitespace(r rune) bool {
+	return unicode.IsSpace(r) || r == '\uFEFF'
+}
+
+// catalogDisplayName sanitizes and trims a display name to ProxUI's limit, falling back when empty.
+func catalogDisplayName(raw, fallback string) string {
+	name := strings.TrimFunc(htmlsanitize.String(raw), isCatalogWhitespace)
+	units := 0
+	for index, r := range name {
+		width := 1
+		if r > 0xFFFF {
+			width = 2
+		}
+		if units+width > catalogDisplayNameMaxUnits {
+			name = strings.TrimFunc(name[:index], isCatalogWhitespace)
+			break
+		}
+		units += width
+	}
+	if name == "" {
+		return fallback
+	}
+	return name
+}
+
+// wireProviderIDs keeps only IDs ProxUI's slug rule accepts; nil stays nil (an open hub).
+func wireProviderIDs(ids []string) []string {
+	if ids == nil {
+		return nil
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if catalogProviderIDPattern.MatchString(id) {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func nonEmptyStringPtr(raw string) *string {
@@ -488,6 +491,7 @@ func ifNoneMatchMatches(headerVal, etag string) bool {
 
 // GetProviderCatalogV8 returns the authoritative catalog of providers this ProxD hub
 // exposes (built-in and plugin-backed), including OAuth, quota, and lifecycle metadata.
+// Every supported provider is listed; accepted_providers says which of them this hub takes.
 func (h *Handler) GetProviderCatalogV8(c *gin.Context) {
 	now := time.Now().UTC()
 	var host *pluginhost.Host
@@ -498,11 +502,13 @@ func (h *Handler) GetProviderCatalogV8(c *gin.Context) {
 	}
 
 	accepted := h.effectiveAcceptedProviders()
-	counts := h.collectProviderCredentialCounts(now, host)
+	counts := h.collectProviderCredentialCounts(now)
 
 	quotaPluginIDs := map[string]string{}
 	quotaSupportsResetByPlugin := map[string]bool{}
 	var registeredQuotaProviders []pluginhost.RegisteredQuotaProviderInfo
+	var registeredPlugins []pluginhost.RegisteredPluginInfo
+	pluginNames := map[string]string{}
 	if host != nil {
 		ctx := c.Request.Context()
 		quotaPluginIDs = host.QuotaProviderPluginIDs(ctx)
@@ -511,6 +517,10 @@ func (h *Handler) GetProviderCatalogV8(c *gin.Context) {
 			if qp.PluginID != "" {
 				quotaSupportsResetByPlugin[qp.PluginID] = qp.SupportsReset
 			}
+		}
+		registeredPlugins = host.RegisteredPlugins()
+		for _, info := range registeredPlugins {
+			pluginNames[info.ID] = info.Metadata.Name
 		}
 	}
 
@@ -564,131 +574,135 @@ func (h *Handler) GetProviderCatalogV8(c *gin.Context) {
 		}
 	}
 
-	// 2. Active plugin OAuth providers.
-	if host != nil {
-		for _, info := range host.RegisteredPlugins() {
-			pluginID := htmlsanitize.String(strings.TrimSpace(info.ID))
-			if pluginID == "" {
-				continue
-			}
-			fallbackName := htmlsanitize.String(strings.TrimSpace(info.Metadata.Name))
-			fallbackLogo := htmlsanitize.String(strings.TrimSpace(info.Metadata.Logo))
+	// 2. Active plugin OAuth providers. Login dispatch tries built-ins first and then plugins in
+	// snapshot order, so an ID already listed keeps its earlier owner. The host runs every plugin
+	// login as a browser flow through the management callback (ServePluginAuthURL), which is what
+	// the oauth descriptor states; the plugin API declares no other flow.
+	for _, info := range registeredPlugins {
+		pluginID := htmlsanitize.String(strings.TrimSpace(info.ID))
+		if pluginID == "" {
+			continue
+		}
+		fallbackLogo := htmlsanitize.String(strings.TrimSpace(info.Metadata.Logo))
 
-			addPluginEntry := func(rawID, rawName, rawLogo string, aliases []string) {
-				id := strings.ToLower(strings.TrimSpace(rawID))
-				if id == "" {
-					return
-				}
-				displayName := htmlsanitize.String(strings.TrimSpace(rawName))
-				if displayName == "" {
-					displayName = fallbackName
-				}
-				if displayName == "" {
-					displayName = id
-				}
-				logoStr := htmlsanitize.String(strings.TrimSpace(rawLogo))
-				if logoStr == "" {
-					logoStr = fallbackLogo
-				}
-				pid := pluginID
-				creds := counts[id]
-				entriesByID[id] = providerCatalogEntry{
-					ID:          id,
-					DisplayName: displayName,
-					Source:      "plugin",
-					PluginID:    &pid,
-					Logo:        nonEmptyStringPtr(logoStr),
-					Lifecycle:   deriveProviderLifecycle(creds),
-					Credentials: creds,
-					OAuth: &providerCatalogOAuth{
-						Flow:           "browser",
-						Aliases:        cloneNonNilStrings(aliases),
-						ManualCallback: true,
-						WebUI:          true,
-						Domains:        []string{},
-					},
-					Quota: resolveQuota(id, false, false),
-				}
+		addPluginEntry := func(rawID, rawName, rawLogo string) {
+			id := strings.ToLower(strings.TrimSpace(rawID))
+			if id == "" {
+				return
 			}
-
-			if len(info.OAuthProviderEntries) > 0 {
-				for _, oauthEntry := range info.OAuthProviderEntries {
-					addPluginEntry(oauthEntry.Identifier, oauthEntry.Name, oauthEntry.Logo, nil)
-				}
-			} else if len(info.OAuthProviders) > 0 {
-				for _, ident := range info.OAuthProviders {
-					addPluginEntry(ident, "", "", nil)
-				}
-			} else if strings.TrimSpace(info.OAuthProvider) != "" {
-				addPluginEntry(info.OAuthProvider, "", "", nil)
+			if _, exists := entriesByID[id]; exists {
+				return
+			}
+			displayName := catalogDisplayName(rawName, catalogDisplayName(info.Metadata.Name, id))
+			logoStr := htmlsanitize.String(strings.TrimSpace(rawLogo))
+			if logoStr == "" {
+				logoStr = fallbackLogo
+			}
+			pid := pluginID
+			creds := counts[id]
+			entriesByID[id] = providerCatalogEntry{
+				ID:          id,
+				DisplayName: displayName,
+				Source:      "plugin",
+				PluginID:    &pid,
+				Logo:        nonEmptyStringPtr(logoStr),
+				Lifecycle:   deriveProviderLifecycle(creds),
+				Credentials: creds,
+				OAuth: &providerCatalogOAuth{
+					Flow:           "browser",
+					Aliases:        []string{},
+					ManualCallback: true,
+					WebUI:          true,
+					Domains:        []string{},
+				},
+				Quota: resolveQuota(id, false, false),
 			}
 		}
 
-		// 3. Quota-only plugin providers (no OAuth capability registered).
-		for _, qp := range registeredQuotaProviders {
-			candidates := qp.SupportedProviders
-			if len(candidates) == 0 && strings.TrimSpace(qp.Provider) != "" {
-				candidates = []string{qp.Provider}
+		if len(info.OAuthProviderEntries) > 0 {
+			for _, oauthEntry := range info.OAuthProviderEntries {
+				addPluginEntry(oauthEntry.Identifier, oauthEntry.Name, oauthEntry.Logo)
 			}
-			for _, rawID := range candidates {
-				id := strings.ToLower(strings.TrimSpace(rawID))
-				if id == "" {
-					continue
-				}
-				if _, exists := entriesByID[id]; exists {
-					continue
-				}
-				displayName := htmlsanitize.String(strings.TrimSpace(qp.DisplayName))
-				if displayName == "" {
-					displayName = id
-				}
-				pid := htmlsanitize.String(strings.TrimSpace(qp.PluginID))
-				var pidPtr *string
-				if pid != "" {
-					pidPtr = &pid
-				}
-				creds := counts[id]
-				entriesByID[id] = providerCatalogEntry{
-					ID:          id,
-					DisplayName: displayName,
-					Source:      "plugin",
-					PluginID:    pidPtr,
-					Logo:        nil,
-					Lifecycle:   deriveProviderLifecycle(creds),
-					Credentials: creds,
-					OAuth:       nil,
-					Quota:       resolveQuota(id, false, false),
-				}
+		} else if len(info.OAuthProviders) > 0 {
+			for _, ident := range info.OAuthProviders {
+				addPluginEntry(ident, "", "")
+			}
+		} else if strings.TrimSpace(info.OAuthProvider) != "" {
+			addPluginEntry(info.OAuthProvider, "", "")
+		}
+	}
+
+	// 3. Quota-only plugin providers (no OAuth capability registered).
+	for _, qp := range registeredQuotaProviders {
+		candidates := qp.SupportedProviders
+		if len(candidates) == 0 && strings.TrimSpace(qp.Provider) != "" {
+			candidates = []string{qp.Provider}
+		}
+		for _, rawID := range candidates {
+			id := strings.ToLower(strings.TrimSpace(rawID))
+			if id == "" {
+				continue
+			}
+			if _, exists := entriesByID[id]; exists {
+				continue
+			}
+			pid := htmlsanitize.String(strings.TrimSpace(qp.PluginID))
+			creds := counts[id]
+			entriesByID[id] = providerCatalogEntry{
+				ID:          id,
+				DisplayName: catalogDisplayName(qp.DisplayName, id),
+				Source:      "plugin",
+				PluginID:    nonEmptyStringPtr(pid),
+				Logo:        nil,
+				Lifecycle:   deriveProviderLifecycle(creds),
+				Credentials: creds,
+				OAuth:       nil,
+				Quota:       resolveQuota(id, false, false),
 			}
 		}
 	}
 
-	// 4. Any credential-bearing provider not already in the catalog (e.g. uploaded/imported credentials).
+	// 4. Credential-bearing providers not listed yet: runtime providers of plugin logins whose
+	// login ID differs, and uploaded or imported credentials. One that no executor serves belongs
+	// to a plugin that is not loaded (every built-in provider has an executor), so it is a
+	// disabled plugin provider rather than an active built-in.
 	for providerID, creds := range counts {
 		if _, exists := entriesByID[providerID]; exists {
 			continue
 		}
-		entriesByID[providerID] = providerCatalogEntry{
+		entry := providerCatalogEntry{
 			ID:          providerID,
-			DisplayName: providerID,
+			DisplayName: catalogDisplayName(providerID, providerID),
 			Source:      "builtin",
-			PluginID:    nil,
-			Logo:        nil,
 			Lifecycle:   deriveProviderLifecycle(creds),
 			Credentials: creds,
-			OAuth:       nil,
 			Quota:       resolveQuota(providerID, false, false),
 		}
+		ownerPluginID := ""
+		if host != nil {
+			ownerPluginID = host.AuthProviderPluginID(providerID)
+			if ownerPluginID == "" {
+				ownerPluginID = quotaPluginIDs[providerID]
+			}
+		}
+		if ownerPluginID != "" {
+			entry.Source = "plugin"
+			entry.PluginID = nonEmptyStringPtr(htmlsanitize.String(ownerPluginID))
+			entry.DisplayName = catalogDisplayName(pluginNames[ownerPluginID], entry.DisplayName)
+		} else if _, served := h.authManager.Executor(providerID); !served {
+			entry.Source = "plugin"
+			entry.Lifecycle = lifecycleDisabled
+		}
+		entriesByID[providerID] = entry
 	}
 
-	// Filter to accepted providers when the hub explicitly declares accepted_providers,
-	// while still retaining any provider that currently holds credentials on this hub.
+	// ProxUI rejects the whole catalog when one ID breaks its slug rule, so such providers
+	// (e.g. an OpenAI-compatible name with spaces) are left out.
 	ids := make([]string, 0, len(entriesByID))
-	for id, entry := range entriesByID {
-		if len(accepted) > 0 && entry.Credentials.Total == 0 && !h.providerMatchesAccepted(id, accepted, host) {
-			continue
+	for id := range entriesByID {
+		if catalogProviderIDPattern.MatchString(id) {
+			ids = append(ids, id)
 		}
-		ids = append(ids, id)
 	}
 	sort.Strings(ids)
 
@@ -705,7 +719,7 @@ func (h *Handler) GetProviderCatalogV8(c *gin.Context) {
 	resp := providerCatalogResponse{
 		SchemaVersion:     providerCatalogSchemaVersion,
 		InstanceID:        instanceIDPtr,
-		AcceptedProviders: accepted,
+		AcceptedProviders: wireProviderIDs(accepted),
 		Providers:         providers,
 	}
 
@@ -715,8 +729,9 @@ func (h *Handler) GetProviderCatalogV8(c *gin.Context) {
 		return
 	}
 
+	// Weak: the same representation may be served identity, gzip or zstd encoded.
 	sum := sha256.Sum256(payload)
-	etag := `"` + hex.EncodeToString(sum[:]) + `"`
+	etag := `W/"` + hex.EncodeToString(sum[:]) + `"`
 	c.Header("ETag", etag)
 	c.Header("Cache-Control", "no-cache")
 	if ifNoneMatchMatches(c.GetHeader("If-None-Match"), etag) {

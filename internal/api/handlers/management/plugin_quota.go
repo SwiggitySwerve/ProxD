@@ -1,6 +1,8 @@
 package management
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -57,12 +59,26 @@ func (h *Handler) GetQuotaProviders(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"providers": host.QuotaProviders(c.Request.Context())})
 }
 
+const (
+	quotaFetchV8RequestLimit  = 64 << 10
+	quotaFetchV8ResponseLimit = 1 << 20
+	quotaFetchV8Timeout       = 30 * time.Second
+)
+
 // FetchCredentialQuotaV8 retrieves normalized quota for a credential via its host-resolved
 // quota plugin only. Caller-supplied plugin_id overrides that do not match the host-resolved
 // plugin are rejected, and declarative quota_probe metadata is excluded from v8 collection.
+// Request and response bodies are size-capped, the plugin call has a deadline, and the host
+// bounds how many of these calls run at once.
 func (h *Handler) FetchCredentialQuotaV8(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, quotaFetchV8RequestLimit)
 	var body credentialQuotaRequest
 	if errBind := c.ShouldBindJSON(&body); errBind != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(errBind, &maxBytesErr) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body too large"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
@@ -86,26 +102,19 @@ func (h *Handler) FetchCredentialQuotaV8(c *gin.Context) {
 		return
 	}
 
-	provider := strings.TrimSpace(auth.Provider)
-	resolvedPluginIDs := host.QuotaProviderPluginIDs(c.Request.Context())
-	resolvedPluginID := strings.TrimSpace(resolvedPluginIDs[strings.ToLower(provider)])
-	if resolvedPluginID == "" {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), quotaFetchV8Timeout)
+	defer cancel()
+	binding, okBinding := host.ResolveQuotaBinding(ctx, auth.Provider)
+	if !okBinding {
 		c.JSON(http.StatusNotImplemented, gin.H{"error": "no quota provider available for credential"})
 		return
 	}
-	if requestedPlugin := strings.TrimSpace(body.PluginID); requestedPlugin != "" && !strings.EqualFold(requestedPlugin, resolvedPluginID) {
+	if requestedPlugin := strings.TrimSpace(body.PluginID); requestedPlugin != "" && !strings.EqualFold(requestedPlugin, binding.PluginID()) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "quota plugin does not match credential provider"})
 		return
 	}
 
-	req := pluginapi.QuotaFetchRequest{
-		AuthIndex:  auth.Index,
-		AuthID:     auth.ID,
-		Provider:   provider,
-		Metadata:   auth.Metadata,
-		Attributes: auth.Attributes,
-	}
-	quotaResp, handled, errFetch := host.FetchQuotaByPlugin(c.Request.Context(), resolvedPluginID, req)
+	quotaResp, handled, errFetch := host.FetchQuotaWithBinding(ctx, binding, auth.Index, auth.ID)
 	if !handled {
 		c.JSON(http.StatusNotImplemented, gin.H{"error": "no quota provider available for credential"})
 		return
@@ -115,7 +124,13 @@ func (h *Handler) FetchCredentialQuotaV8(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to fetch quota: %v", errFetch)})
 		return
 	}
-	c.JSON(http.StatusOK, quotaResp)
+	payload, errMarshal := json.Marshal(quotaResp)
+	if errMarshal != nil || len(payload) > quotaFetchV8ResponseLimit {
+		log.Warnf("v8 quota response for credential %s is invalid or larger than %d bytes", auth.Index, quotaFetchV8ResponseLimit)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "invalid quota response"})
+		return
+	}
+	c.Data(http.StatusOK, "application/json; charset=utf-8", payload)
 }
 
 // FetchCredentialQuota retrieves normalized quota for a credential via its quota provider or declarative probe.

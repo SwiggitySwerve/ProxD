@@ -265,6 +265,15 @@ func (h *Host) SameAuthProvider(providerA, providerB string) bool {
 	return false
 }
 
+// AuthProviderPluginID returns the ID of the active plugin that owns provider as a login or
+// credential provider, with the same precedence as login dispatch; empty when none does.
+func (h *Host) AuthProviderPluginID(provider string) string {
+	if record := h.authProviderRecord(provider); record != nil {
+		return record.id
+	}
+	return ""
+}
+
 func (h *Host) authProviderRecord(provider string) *capabilityRecord {
 	record, _ := h.authProviderEntry(provider)
 	return record

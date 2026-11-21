@@ -97,6 +97,13 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 				if file != nil {
 					failureName = filepath.Base(file.Filename)
 				}
+				var notAccepted *providerNotAcceptedError
+				if errors.As(errUpload, &notAccepted) {
+					failure := notAccepted.responseBody()
+					failure["name"] = failureName
+					failed = append(failed, failure)
+					continue
+				}
 				msg := errUpload.Error()
 				if errors.Is(errUpload, errAuthFileMustBeJSON) {
 					msg = "file must be .json"
@@ -316,7 +323,7 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 		return err
 	}
 	if auth != nil {
-		if errAccepted := h.checkAcceptedProvider(auth.Provider); errAccepted != nil {
+		if errAccepted := h.checkAcceptedAuth(auth); errAccepted != nil {
 			return errAccepted
 		}
 	}
@@ -353,10 +360,7 @@ func (h *Handler) writeAuthFileV8(ctx context.Context, name string, data []byte)
 		return errBuild
 	}
 	for _, auth := range auths {
-		if auth == nil {
-			continue
-		}
-		if errAccepted := h.checkAcceptedProvider(auth.Provider); errAccepted != nil {
+		if errAccepted := h.checkAcceptedAuth(auth); errAccepted != nil {
 			return errAccepted
 		}
 	}

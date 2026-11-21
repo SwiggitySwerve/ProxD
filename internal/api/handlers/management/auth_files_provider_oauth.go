@@ -566,6 +566,11 @@ func (h *Handler) commitAndCompleteBuiltinOAuthSession(ctx context.Context, stat
 		}
 	}
 
+	if errAccepted := h.checkAcceptedAuth(record); errAccepted != nil {
+		SetOAuthSessionError(state, "provider_not_accepted")
+		log.Warnf("%s OAuth login not saved: %v", record.Provider, errAccepted)
+		return "", false
+	}
 	applySessionProxyToAuthRecord(record, sessionProxyURL)
 	if errGuard := claimOAuthSessionCommit(state, sessionProvider); errGuard != nil {
 		return "", false
@@ -1381,6 +1386,14 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 					FailOAuthSessionCommit(state, "Authentication failed")
 					c.JSON(http.StatusOK, gin.H{"status": "error", "error": "Authentication failed"})
 					return
+				}
+				for _, record := range records {
+					if errAccepted := h.checkAcceptedAuth(record); errAccepted != nil {
+						log.WithError(errAccepted).WithField("provider", provider).Warn("plugin OAuth login not saved")
+						FailOAuthSessionCommit(state, "provider_not_accepted")
+						c.JSON(http.StatusOK, gin.H{"status": "error", "error": "provider_not_accepted"})
+						return
+					}
 				}
 				target, hasTarget := GetOAuthSessionTarget(state)
 				isTargeted := hasTarget && strings.TrimSpace(target.AuthID) != ""

@@ -2,6 +2,7 @@ package management
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -103,6 +104,11 @@ func (h *Handler) ImportVertexCredential(c *gin.Context) {
 		ctx = reqCtx
 	}
 	savedPath, err := h.saveTokenRecord(ctx, record)
+	var notAccepted *providerNotAcceptedError
+	if errors.As(err, &notAccepted) {
+		c.JSON(http.StatusConflict, notAccepted.responseBody())
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "save_failed", "message": err.Error()})
 		return

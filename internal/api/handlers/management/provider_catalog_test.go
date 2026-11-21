@@ -132,11 +132,16 @@ func TestGetProviderCatalogV8_ContractLifecycleAndETag(t *testing.T) {
 	if len(resp.AcceptedProviders) != 2 || resp.AcceptedProviders[0] != "antigravity" || resp.AcceptedProviders[1] != "example-plugin" {
 		t.Fatalf("accepted_providers = %#v", resp.AcceptedProviders)
 	}
-	if len(resp.Providers) != 2 {
-		t.Fatalf("providers len = %d, want 2: %#v", len(resp.Providers), resp.Providers)
+	// Every supported provider is listed; accepted_providers only says which ones this hub takes.
+	if len(resp.Providers) != len(builtinOAuthProviders)+1 {
+		t.Fatalf("providers len = %d, want %d: %#v", len(resp.Providers), len(builtinOAuthProviders)+1, resp.Providers)
 	}
+	if !strings.HasPrefix(etag, `W/"`) {
+		t.Fatalf("ETag = %q, want a weak validator", etag)
+	}
+	assertProxUICatalog(t, rec.Body.Bytes())
 
-	anti := resp.Providers[0]
+	anti := catalogEntry(t, resp, "antigravity")
 	if anti.ID != "antigravity" || anti.Source != "builtin" || anti.Lifecycle != lifecycleActive {
 		t.Fatalf("unexpected antigravity entry: %+v", anti)
 	}
@@ -144,7 +149,7 @@ func TestGetProviderCatalogV8_ContractLifecycleAndETag(t *testing.T) {
 		t.Fatalf("unexpected antigravity counts/quota: %+v", anti)
 	}
 
-	pluginEntry := resp.Providers[1]
+	pluginEntry := catalogEntry(t, resp, "example-plugin")
 	if pluginEntry.ID != "example-plugin" || pluginEntry.Source != "plugin" || pluginEntry.Lifecycle != lifecycleAwaitingAuth {
 		t.Fatalf("unexpected plugin entry: %+v", pluginEntry)
 	}
@@ -194,8 +199,8 @@ func TestGetProviderCatalogV8_ContractLifecycleAndETag(t *testing.T) {
 	if err := json.Unmarshal(recAfter.Body.Bytes(), &afterResp); err != nil {
 		t.Fatalf("decode after catalog: %v", err)
 	}
-	if afterResp.Providers[0].Lifecycle != lifecycleDisabled || afterResp.Providers[0].Credentials.Disabled != 1 {
-		t.Fatalf("expected disabled lifecycle, got %+v", afterResp.Providers[0])
+	if afterAnti := catalogEntry(t, afterResp, "antigravity"); afterAnti.Lifecycle != lifecycleDisabled || afterAnti.Credentials.Disabled != 1 {
+		t.Fatalf("expected disabled lifecycle, got %+v", afterAnti)
 	}
 
 	// Re-enable with RequiresSignIn -> needs_attention.
@@ -217,8 +222,8 @@ func TestGetProviderCatalogV8_ContractLifecycleAndETag(t *testing.T) {
 	if err := json.Unmarshal(recErr.Body.Bytes(), &errResp); err != nil {
 		t.Fatalf("decode err catalog: %v", err)
 	}
-	if errResp.Providers[0].Lifecycle != lifecycleNeedsAttention || errResp.Providers[0].Credentials.Problem != 1 {
-		t.Fatalf("expected needs_attention lifecycle, got %+v", errResp.Providers[0])
+	if errAnti := catalogEntry(t, errResp, "antigravity"); errAnti.Lifecycle != lifecycleNeedsAttention || errAnti.Credentials.Problem != 1 {
+		t.Fatalf("expected needs_attention lifecycle, got %+v", errAnti)
 	}
 }
 
@@ -343,11 +348,16 @@ func TestFetchCredentialQuotaV8_BindingExtendedBucketsAndNoProbe(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 
 	period := int64(18000)
+	pluginPath := filepath.Join(authDir, "plugin-cred.json")
+	if err := os.WriteFile(pluginPath, []byte(`{"type":"example-plugin"}`), 0o600); err != nil {
+		t.Fatalf("write plugin auth: %v", err)
+	}
 	pluginAuth, err := manager.Register(context.Background(), &coreauth.Auth{
-		ID:       "plugin-cred.json",
-		FileName: "plugin-cred.json",
-		Provider: "example-plugin",
-		Status:   coreauth.StatusActive,
+		ID:         "plugin-cred.json",
+		FileName:   "plugin-cred.json",
+		Provider:   "example-plugin",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{coreauth.AttributePath: pluginPath},
 	})
 	if err != nil {
 		t.Fatalf("register plugin auth: %v", err)
@@ -370,7 +380,9 @@ func TestFetchCredentialQuotaV8_BindingExtendedBucketsAndNoProbe(t *testing.T) {
 	}
 	probeOnlyAuth.EnsureIndex()
 
+	var gotReq pluginapi.QuotaFetchRequest
 	host := pluginhost.New()
+	host.SetAuthManager(manager)
 	host.RegisterPluginForTest("example-quota-plugin", pluginapi.Plugin{
 		Metadata: pluginapi.Metadata{Name: "Example Quota"},
 		Capabilities: pluginapi.Capabilities{
@@ -378,6 +390,7 @@ func TestFetchCredentialQuotaV8_BindingExtendedBucketsAndNoProbe(t *testing.T) {
 				identifier: "example-plugin",
 				supported:  []string{"example-plugin"},
 				fetchFn: func(ctx context.Context, req pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
+					gotReq = req
 					return pluginapi.QuotaFetchResponse{
 						Groups: []pluginapi.QuotaGroup{
 							{
@@ -431,6 +444,10 @@ func TestFetchCredentialQuotaV8_BindingExtendedBucketsAndNoProbe(t *testing.T) {
 	bucket := got.Groups[0].Buckets[0]
 	if bucket.ID != "five-hour" || bucket.PeriodSeconds == nil || *bucket.PeriodSeconds != 18000 || bucket.Scope != "account" {
 		t.Fatalf("extended bucket fields not preserved: %+v", bucket)
+	}
+	// The plugin gets the credential's own file bytes and runtime provider from one host lookup.
+	if string(gotReq.StorageJSON) != `{"type":"example-plugin"}` || gotReq.AuthID != "plugin-cred.json" || gotReq.Provider != "example-plugin" {
+		t.Fatalf("unexpected plugin request: id=%q provider=%q storage=%q", gotReq.AuthID, gotReq.Provider, gotReq.StorageJSON)
 	}
 
 	// 2. Mismatched caller plugin_id is rejected with 403 Forbidden.

@@ -2,6 +2,7 @@ package pluginhost
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -334,6 +335,68 @@ func (h *Host) FetchQuotaByPlugin(ctx context.Context, pluginID string, req plug
 	return h.callQuotaFetch(ctx, *record, record.plugin.Capabilities.QuotaProvider, req)
 }
 
+// QuotaBinding is the quota plugin resolved for one provider from a single runtime snapshot.
+type QuotaBinding struct {
+	record   capabilityRecord
+	provider string
+}
+
+// PluginID returns the ID of the bound quota plugin.
+func (b QuotaBinding) PluginID() string {
+	return b.record.id
+}
+
+// ResolveQuotaBinding selects the quota plugin for provider with the same precedence as FetchQuota.
+func (h *Host) ResolveQuotaBinding(ctx context.Context, provider string) (QuotaBinding, bool) {
+	record := h.quotaProviderRecord(ctx, provider)
+	if record == nil {
+		return QuotaBinding{}, false
+	}
+	return QuotaBinding{record: *record, provider: normalizeProviderID(provider)}, true
+}
+
+// quotaFetchSlots bounds concurrent FetchQuotaWithBinding plugin calls.
+var quotaFetchSlots = make(chan struct{}, 4)
+
+var errQuotaCredentialChanged = errors.New("credential changed before quota fetch")
+
+// FetchQuotaWithBinding calls the bound plugin for the credential at authIndex. The request comes
+// from one lookup of that credential (record and file bytes), which must still be authID under the
+// bound provider. A concurrency slot is held until the plugin call itself returns, even when ctx
+// ends first and the caller has already gone.
+func (h *Host) FetchQuotaWithBinding(ctx context.Context, binding QuotaBinding, authIndex, authID string) (pluginapi.QuotaFetchResponse, bool, error) {
+	provider := binding.record.plugin.Capabilities.QuotaProvider
+	if h == nil || provider == nil {
+		return pluginapi.QuotaFetchResponse{}, false, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case quotaFetchSlots <- struct{}{}:
+	case <-ctx.Done():
+		return pluginapi.QuotaFetchResponse{}, true, ctx.Err()
+	}
+	ctx, release := withPluginCallFinish(ctx, func() { <-quotaFetchSlots })
+	defer release()
+	auth, rawJSON, errLookup := h.authPhysicalJSONByIndex(authIndex)
+	if errLookup != nil {
+		return pluginapi.QuotaFetchResponse{}, true, errLookup
+	}
+	if auth.ID != authID || normalizeProviderID(auth.Provider) != binding.provider {
+		return pluginapi.QuotaFetchResponse{}, true, errQuotaCredentialChanged
+	}
+	req := pluginapi.QuotaFetchRequest{
+		AuthIndex:   authIndex,
+		AuthID:      auth.ID,
+		Provider:    auth.Provider,
+		StorageJSON: rawJSON,
+		Metadata:    auth.Metadata,
+		Attributes:  auth.Attributes,
+	}
+	return h.callQuotaFetchFor(ctx, binding.record, provider, req, auth)
+}
+
 // ResetQuota resets quota or usage for a credential if supported.
 func (h *Host) ResetQuota(ctx context.Context, req pluginapi.QuotaResetRequest) (pluginapi.QuotaResetResponse, bool, error) {
 	record := h.quotaProviderRecord(ctx, req.Provider)
@@ -415,6 +478,13 @@ func (h *Host) callQuotaFetch(ctx context.Context, record capabilityRecord, prov
 				req.Attributes = auth.Attributes
 			}
 		}
+	}
+	return h.callQuotaFetchFor(ctx, record, provider, req, authRecord)
+}
+
+func (h *Host) callQuotaFetchFor(ctx context.Context, record capabilityRecord, provider pluginapi.QuotaProvider, req pluginapi.QuotaFetchRequest, authRecord *coreauth.Auth) (resp pluginapi.QuotaFetchResponse, handled bool, err error) {
+	if h == nil || provider == nil || h.isPluginFused(record.id) || !h.recordCurrent(record) {
+		return pluginapi.QuotaFetchResponse{}, false, nil
 	}
 	if req.HTTPClient == nil {
 		req.HTTPClient = h.newHTTPClient(authRecord, req.Provider)
