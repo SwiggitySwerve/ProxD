@@ -465,16 +465,23 @@ func (h *Handler) resolveTargetOAuthProvider(targetAuth *coreauth.Auth) string {
 			}
 		}
 	}
-	rawProvider := strings.TrimSpace(targetAuth.Provider)
-	switch strings.ToLower(rawProvider) {
-	case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
-		if kimi.IsKimiAIAuth(targetAuth) {
-			return "kimi-ai"
-		}
-		return "kimi"
-	default:
-		return rawProvider
+	if signInID, isKimi := kimiSignInProviderID(targetAuth); isKimi {
+		return signInID
 	}
+	return strings.TrimSpace(targetAuth.Provider)
+}
+
+// kimiSignInProviderID maps a built-in Kimi credential, under any provider spelling, to its
+// sign-in entry by domain alone.
+func kimiSignInProviderID(auth *coreauth.Auth) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
+	case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
+		if kimi.IsKimiAIAuth(auth) {
+			return "kimi-ai", true
+		}
+		return "kimi", true
+	}
+	return "", false
 }
 
 func (h *Handler) oauthTargetAuthMatches(targetAuth *coreauth.Auth, requestedProvider string) bool {

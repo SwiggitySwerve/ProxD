@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MoeForge/moego/json"
@@ -1207,14 +1208,26 @@ func (h *Host) AuthDataToCoreAuth(data pluginapi.AuthData, path, fileName string
 
 type pluginTokenStorage struct {
 	provider string
-	rawJSON  []byte
-	meta     map[string]any
+	// mu guards rawJSON and meta: saves call SetMetadata while executors and quota fetch read
+	// RawJSON from the same published record. Both fields are replaced, never mutated in place.
+	mu      sync.RWMutex
+	rawJSON []byte
+	meta    map[string]any
+}
+
+// snapshot returns the current raw payload and metadata; callers must not modify them.
+func (s *pluginTokenStorage) snapshot() ([]byte, map[string]any) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rawJSON, s.meta
 }
 
 func (s *pluginTokenStorage) SetMetadata(meta map[string]any) {
 	if s == nil {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, hadPriority := s.meta["priority"]; hadPriority {
 		if _, hasPriority := meta["priority"]; !hasPriority {
 			var raw map[string]any
@@ -1233,7 +1246,8 @@ func (s *pluginTokenStorage) RawJSON() []byte {
 	if s == nil {
 		return nil
 	}
-	payload, errPayload := mergedStorageJSON(s.rawJSON, s.meta, s.provider)
+	raw, meta := s.snapshot()
+	payload, errPayload := mergedStorageJSON(raw, meta, s.provider)
 	if errPayload != nil {
 		return nil
 	}
@@ -1244,7 +1258,8 @@ func (s *pluginTokenStorage) SaveTokenToFile(path string) error {
 	if s == nil {
 		return fmt.Errorf("plugin token storage is nil")
 	}
-	payload, errPayload := mergedStorageJSON(s.rawJSON, s.meta, s.provider)
+	raw, meta := s.snapshot()
+	payload, errPayload := mergedStorageJSON(raw, meta, s.provider)
 	if errPayload != nil {
 		return errPayload
 	}

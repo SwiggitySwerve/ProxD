@@ -15,7 +15,6 @@ import (
 
 	"github.com/MoeForge/moego/json"
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/kimi"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/htmlsanitize"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
@@ -309,15 +308,10 @@ func (h *Handler) signInProviderID(auth *coreauth.Auth) string {
 	if auth == nil {
 		return ""
 	}
-	runtimeID := canonicalBuiltinProviderKey(auth.Provider)
-	switch runtimeID {
-	case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
-		// Built-in Kimi picks its sign-in entry from the credential's domain alone.
-		if kimi.IsKimiAIAuth(auth) {
-			return "kimi-ai"
-		}
-		return "kimi"
+	if signInID, isKimi := kimiSignInProviderID(auth); isKimi {
+		return signInID
 	}
+	runtimeID := canonicalBuiltinProviderKey(auth.Provider)
 	if _, builtin := findBuiltinOAuthProvider(runtimeID); builtin {
 		// Built-in login dispatch wins over plugins, so no portal hint relabels it.
 		return runtimeID
