@@ -10,7 +10,9 @@ Before the host cutover these were `~/.local/share/cli-proxy-{api,claude,gemini}
 ```
 deploy/local/
   bin/gotest.sh          gofmt -l + go vet + go test in a Go container (no host Go needed)
-  bin/roll.sh            roll an image to staging or a live quadlet unit
+  bin/roll.sh            roll an image to staging or one live quadlet unit
+  bin/roll-all.sh        roll all three live hubs in one command, with the host's conditions built in
+  bin/roll.test.sh       shell checks for roll.sh and roll-all.sh (stubs only, touches nothing live)
   staging/               isolated staging stack: proxy + mock upstream in one pod
     up.sh down.sh status.sh logs.sh
     config.template.yaml proxy config template (placeholders only)
@@ -149,24 +151,83 @@ this script.
 
 ## Roll and rollback
 
+### All three hubs: one command
+
+```bash
+deploy/local/bin/roll-all.sh --dry-run <image-tag>     # reads quadlets, timers, exporter; prints the plan
+deploy/local/bin/roll-all.sh --approved <image-tag>    # rolls codex, then claude, then gemini
+```
+
+This is the normal way to roll the live hubs. Build the image first (see above); it
+refuses an image that is not present locally. No step is done by hand:
+
+- **Own unit.** Started from a shell, it re-executes itself in a transient
+  `systemd-run --user --wait` unit, `proxd-roll-all-<timestamp>`, with `IOSchedulingClass=idle`
+  and `Nice=10`, and follows that unit's log in the terminal. The unit keeps going if the
+  terminal, T3 or a Claude session dies, which matters because `proxd-claude` carries the
+  operator's own Claude sessions. Run inside a service already (a `systemd-run` of your
+  own), it does not nest. Only one run at a time (a lock under `roll-all/`).
+- **Nightly windows.** It refuses to start from 01:00 to 04:00, 04:20 to 07:00 and 12:20
+  to 13:00 UTC, or less than `WINDOW_MARGIN_MIN` (20) minutes before one, and it stops
+  before the next hub if one comes up during the run.
+- **Quiet moments.** It restarts a hub only when none of `proxd-recovery-check`,
+  `proxd-rerank`, `prox-auth-janitor` and `proxd-claude-ua-sync` (which can itself restart
+  `proxd-claude`) fires in the next 120 s or fired in the last 60 s, and none of their
+  services is running. It waits up to 15 minutes for one, then stops. The times come from
+  `systemctl --user list-timers --output=json`, not from fixed minutes: these are
+  `OnUnitActiveSec` timers, so the minute they fire at moves after every boot and every
+  run. The `:x4:41` / `:x3:53` / `:18:53` minutes of one day are wrong on the next. A
+  timer that is not loaded fails the run; `QUIET_TIMERS` names the set.
+- **One hub at a time.** For each hub it runs `roll.sh --approved <hub> <image>` (which
+  checks `/healthz` and the API), then waits up to 180 s for the exporter
+  (`127.0.0.1:9787/metrics`) to show `proxd_usage_source_subscribed{instance="<hub>-primary"} 1`,
+  the instance being the quadlet's `CLIPROXY_INSTANCE_ID`. It reads the whole page and
+  then matches: `curl | grep -q` under `pipefail` fails when grep stops early (curl gets
+  EPIPE on the ~300 KB page and exits 23), which once rolled back a healthy hub. Before
+  touching anything it checks that all three sources are subscribed, so an exporter
+  outage cannot make it roll back a good hub.
+- **Stop on failure.** If a hub fails either check, it rolls that hub back to the `Image=`
+  line read from its quadlet before the roll (at once: a broken hub does not wait for a
+  quiet moment), reports whether `/healthz` answers again,
+  and stops without touching the remaining hubs.
+- **Rollback.** It prints the rollback commands for all three hubs before it starts, and
+  again for the hubs it rolled when it finishes or stops. A hub already on `<image-tag>`
+  is skipped, so the same command after a stop rolls only the rest.
+
+The run log is `~/.local/share/proxd/roll-all/<timestamp>.log`
+(`LIVE_DATA_ROOT`, default `~/.local/share/proxd`); `journalctl --user -u proxd-roll-all-<timestamp>`
+shows the unit's result.
+
+### One target
+
 ```bash
 deploy/local/bin/roll.sh staging <image-tag>
 deploy/local/bin/roll.sh --dry-run claude <image-tag>      # print only, touches nothing
 deploy/local/bin/roll.sh --approved claude <image-tag>     # live: proxd-claude.container
 deploy/local/bin/roll.sh --approved codex  <image-tag>     # live: proxd-codex.container
+deploy/local/bin/roll.sh --approved gemini <image-tag>     # live: proxd-gemini.container
 ```
 
-A live roll records the running image under `<data dir>/rollback/`, rewrites the unit's
-`Image=` line, runs `daemon-reload`, restarts only that unit, smoke-checks `/healthz`
-and prints the rollback command, which is the same script with the previous image:
-`roll.sh --approved <target> <previous-image>`. Without `--approved` a live target is
-refused. If the health check fails the script exits non-zero and prints the rollback
-command; it does not roll back by itself.
+A live roll records the unit's current `Image=` line under `<hub data dir>/rollback/`
+(`~/.local/share/proxd/<hub>/rollback/`), rewrites that line, runs `daemon-reload`,
+restarts only that unit, smoke-checks `/healthz` and prints the rollback command, which
+is the same script with the previous image: `roll.sh --approved <target> <previous-image>`.
+The previous image is the quadlet's `Image=` line, not what podman reports for the
+container, which can be an older alias of the same image (`localhost/cli-proxy-api:*`).
+Without `--approved` a live target is refused. If the health check fails the script exits
+non-zero and prints the rollback command; it does not roll back by itself (`roll-all.sh`
+does). `roll.sh` alone has none of the unit, window or timer checks above.
 
 ## Tests
 
 `deploy/local/bin/gotest.sh [packages...]` (default `./...`) fails on any file `gofmt -l`
 lists, then runs `go vet` and `go test`.
+
+`deploy/local/bin/roll.test.sh` checks `roll.sh` and `roll-all.sh` with fake quadlets
+(`LIVE_UNIT_DIR`), a temp data dir (`LIVE_DATA_ROOT`), a pinned clock and stubbed
+`systemctl`, `systemd-run`, `podman`, `curl` and `sleep` on `PATH`, so it touches nothing
+live. It covers the dry runs, the windows, the timer logic, the subscription check under
+`pipefail`, and stop-on-failure with rollback. It runs in about two seconds.
 
 ## Rule: never copy live auth
 
