@@ -523,5 +523,5 @@ the baseline for that caller and session ID (upstream ordering, not changed here
 Upstream's credential-scoped after-auth refusal (`TerminateScope: "credential"`) meets the
 all-cooled round like this: a refusal before the round starts is part of the error the
 round saves, so it is still returned when no recheck succeeds; a refusal of the half-open
-trial itself is not, and the request returns the saved cooldown 429, the same answer it
-gave before the trial ran.
+trial itself does not change the saved error, so the request returns what it would have
+returned before the trial ran (usually the cooldown 429).
