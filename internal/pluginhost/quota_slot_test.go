@@ -3,6 +3,8 @@ package pluginhost
 import (
 	"context"
 	"errors"
+	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,10 +15,7 @@ import (
 // A caller that gives up during a cold DescribeQuota over a guarded RPC client returns at once,
 // but its quota slot stays held until the native describe call returns.
 func TestFetchQuotaForCredentialHoldsSlotThroughCanceledDescribe(t *testing.T) {
-	saved := quotaFetchSlots
-	quotaFetchSlots = make(chan struct{}, 1)
-	defer func() { quotaFetchSlots = saved }()
-
+	baseline := len(quotaFetchSlots)
 	manager := coreauth.NewManager(nil, nil, nil)
 	auth, errRegister := manager.Register(context.Background(), &coreauth.Auth{ID: "slow-cred", Provider: "slow-runtime", Status: coreauth.StatusActive})
 	if errRegister != nil {
@@ -26,6 +25,9 @@ func TestFetchQuotaForCredentialHoldsSlotThroughCanceledDescribe(t *testing.T) {
 
 	inner := &blockingGuardPluginClient{started: make(chan struct{}), release: make(chan struct{})}
 	guarded := newGuardedPluginClient(inner)
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(inner.release) }) }
+	t.Cleanup(release)
 	host := New()
 	host.SetAuthManager(manager)
 	host.RegisterPluginForTest("slow-plugin", pluginapi.Plugin{
@@ -37,14 +39,8 @@ func TestFetchQuotaForCredentialHoldsSlotThroughCanceledDescribe(t *testing.T) {
 		},
 	})
 
-	released := false
-	t.Cleanup(func() {
-		if !released {
-			close(inner.release)
-		}
-	})
-
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan error, 1)
 	go func() {
 		_, _, err := host.FetchQuotaForCredential(ctx, "slow-runtime", "", auth.Index, auth.ID)
@@ -64,15 +60,23 @@ func TestFetchQuotaForCredentialHoldsSlotThroughCanceledDescribe(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("canceled call did not return")
 	}
-	if len(quotaFetchSlots) != 1 {
-		t.Fatalf("slots held after the caller left while DescribeQuota still runs = %d, want 1", len(quotaFetchSlots))
+	if len(quotaFetchSlots) != baseline+1 {
+		t.Fatalf("slots held after the caller left while DescribeQuota still runs = %d, want %d", len(quotaFetchSlots), baseline+1)
 	}
 
-	released = true
-	close(inner.release)
-	guarded.Shutdown()
-	if len(quotaFetchSlots) != 0 {
-		t.Fatalf("slots held after the native call returned = %d, want 0", len(quotaFetchSlots))
+	release()
+	shutdown := make(chan struct{})
+	go func() {
+		guarded.Shutdown()
+		close(shutdown)
+	}()
+	select {
+	case <-shutdown:
+	case <-time.After(5 * time.Second):
+		t.Fatal("guarded client shutdown did not finish")
+	}
+	if len(quotaFetchSlots) != baseline {
+		t.Fatalf("slots held after the native call returned = %d, want %d", len(quotaFetchSlots), baseline)
 	}
 }
 
@@ -93,4 +97,18 @@ func TestPluginTokenStorageConcurrentMetadataAndRead(t *testing.T) {
 		}
 	}
 	<-done
+}
+
+// The watcher compares Auths, storage included, with reflect.DeepEqual; a quota read holding the
+// storage lock must not make an unchanged plugin credential look modified.
+func TestPluginTokenStorageEqualWhileReadLocked(t *testing.T) {
+	newAuth := func() *coreauth.Auth {
+		return &coreauth.Auth{ID: "same", Provider: "race", Storage: &pluginTokenStorage{provider: "race", rawJSON: []byte(`{"type":"race"}`), meta: map[string]any{"email": "user@example.test"}}}
+	}
+	held, other := newAuth(), newAuth()
+	unlock := held.Storage.(*pluginTokenStorage).readLock()
+	defer unlock()
+	if !reflect.DeepEqual(held, other) {
+		t.Fatal("an unchanged plugin credential compares as modified while its storage is read-locked")
+	}
 }

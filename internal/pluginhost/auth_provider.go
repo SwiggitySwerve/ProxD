@@ -1208,17 +1208,25 @@ func (h *Host) AuthDataToCoreAuth(data pluginapi.AuthData, path, fileName string
 
 type pluginTokenStorage struct {
 	provider string
-	// mu guards rawJSON and meta: saves call SetMetadata while executors and quota fetch read
-	// RawJSON from the same published record. Both fields are replaced, never mutated in place.
-	mu      sync.RWMutex
-	rawJSON []byte
-	meta    map[string]any
+	rawJSON  []byte
+	meta     map[string]any
+}
+
+// pluginTokenStorageMu guards rawJSON and meta of every pluginTokenStorage: saves call SetMetadata
+// while executors and quota fetch read RawJSON from the same published record. It lives outside
+// the struct because the watcher compares Auths, storage included, with reflect.DeepEqual, and a
+// held lock must not make an unchanged credential look modified. Both fields are replaced, never
+// mutated in place.
+var pluginTokenStorageMu sync.RWMutex
+
+func (s *pluginTokenStorage) readLock() func() {
+	pluginTokenStorageMu.RLock()
+	return pluginTokenStorageMu.RUnlock
 }
 
 // snapshot returns the current raw payload and metadata; callers must not modify them.
 func (s *pluginTokenStorage) snapshot() ([]byte, map[string]any) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	defer s.readLock()()
 	return s.rawJSON, s.meta
 }
 
@@ -1226,8 +1234,8 @@ func (s *pluginTokenStorage) SetMetadata(meta map[string]any) {
 	if s == nil {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	pluginTokenStorageMu.Lock()
+	defer pluginTokenStorageMu.Unlock()
 	if _, hadPriority := s.meta["priority"]; hadPriority {
 		if _, hasPriority := meta["priority"]; !hasPriority {
 			var raw map[string]any
