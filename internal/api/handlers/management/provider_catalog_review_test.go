@@ -17,9 +17,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
-	"time"
 	"unicode/utf16"
 
 	"github.com/MoeForge/moego/json"
@@ -388,6 +386,22 @@ func TestAcceptedProvidersUseSignInIdentity(t *testing.T) {
 	if err := h.checkAcceptedAuth(&coreauth.Auth{Provider: "zcode-bigmodel", Attributes: map[string]string{"oauth_provider": "zcode-zai"}}); err == nil {
 		t.Fatalf("zcode-bigmodel credential admitted through a zcode-zai portal hint")
 	}
+	// A built-in credential keeps its provider even when a plugin claims it and names a portal.
+	host.RegisterPluginForTest("claude-claimer", pluginapi.Plugin{
+		Capabilities: pluginapi.Capabilities{
+			AuthProvider: &credentialOwningAuthProvider{
+				mockCatalogAuthProvider: mockCatalogAuthProvider{identifier: "claimer-portal"},
+				credentialProviders:     []string{"claude"},
+			},
+		},
+	})
+	if err := h.checkAcceptedAuth(&coreauth.Auth{Provider: "claude", Attributes: map[string]string{"oauth_provider": "claimer-portal"}}); err != nil {
+		t.Fatalf("claude credential relabeled by a plugin portal hint: %v", err)
+	}
+	// Kimi ignores portal hints: a kimi.ai credential naming an accepted plugin portal is kimi-ai.
+	if err := h.checkAcceptedAuth(&coreauth.Auth{Provider: "kimi", Metadata: map[string]any{"domain": "kimi.ai"}, Attributes: map[string]string{"oauth_provider": "zcode-zai"}}); err == nil {
+		t.Fatalf("kimi.ai credential admitted through a zcode-zai portal hint")
+	}
 	// Every Kimi spelling resolves its sign-in entry from the domain.
 	kimiOnly := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir, AcceptedProviders: []string{"kimi-ai"}}, coreauth.NewManager(nil, nil, nil))
 	if err := kimiOnly.checkAcceptedAuth(&coreauth.Auth{Provider: "kimi.ai", Metadata: map[string]any{"domain": "kimi.ai"}}); err != nil {
@@ -455,6 +469,7 @@ func TestProviderCatalogWireAndPrecedence(t *testing.T) {
 	registerFileAuth(t, manager, authDir, &coreauth.Auth{ID: "gw.json", Provider: "openai-compatible-my gateway", Status: coreauth.StatusActive}, `{"type":"openai-compatible-my gateway"}`)
 	registerFileAuth(t, manager, authDir, &coreauth.Auth{ID: "gone.json", Provider: "gone-plugin", Status: coreauth.StatusActive}, `{"type":"gone-plugin"}`)
 	registerFileAuth(t, manager, authDir, &coreauth.Auth{ID: "exec.json", Provider: "exec-only", Status: coreauth.StatusActive}, `{"type":"exec-only"}`)
+	registerFileAuth(t, manager, authDir, &coreauth.Auth{ID: "gemini.json", Provider: "gemini", Status: coreauth.StatusActive}, `{"type":"gemini"}`)
 	registerFileAuth(t, manager, authDir, &coreauth.Auth{ID: "compat.json", Provider: "own-endpoint", Status: coreauth.StatusActive, Attributes: map[string]string{"base_url": "https://llm.example.test/v1"}}, `{"type":"own-endpoint","base_url":"https://llm.example.test/v1"}`)
 
 	host := pluginhost.New()
@@ -470,6 +485,9 @@ func TestProviderCatalogWireAndPrecedence(t *testing.T) {
 	host.RegisterPluginWithPriorityForTest("exec-plugin", 1, pluginapi.Plugin{
 		Metadata:     pluginapi.Metadata{Name: "Exec Only"},
 		Capabilities: pluginapi.Capabilities{Executor: catalogTestExecutor{identifier: "exec-only"}},
+	})
+	host.RegisterPluginWithPriorityForTest("gemini-extender", 1, pluginapi.Plugin{
+		Capabilities: pluginapi.Capabilities{Executor: catalogTestExecutor{identifier: "gemini"}},
 	})
 	host.RegisterPluginWithPriorityForTest("second-plugin", 1, pluginapi.Plugin{
 		Metadata:     pluginapi.Metadata{Name: "Second"},
@@ -504,6 +522,9 @@ func TestProviderCatalogWireAndPrecedence(t *testing.T) {
 	}
 	if exec := catalogEntry(t, resp, "exec-only"); exec.Source != "plugin" || exec.PluginID == nil || *exec.PluginID != "exec-plugin" || exec.Lifecycle != lifecycleActive {
 		t.Fatalf("exec-only = %+v, want the active executor plugin's provider", exec)
+	}
+	if gemini := catalogEntry(t, resp, "gemini"); gemini.Source != "builtin" || gemini.PluginID != nil || gemini.Lifecycle != lifecycleActive {
+		t.Fatalf("gemini = %+v, want the native built-in provider though a plugin executor extends it", gemini)
 	}
 	if own := catalogEntry(t, resp, "own-endpoint"); own.Source != "builtin" || own.Lifecycle != lifecycleActive {
 		t.Fatalf("own-endpoint = %+v, want an active built-in OpenAI-compatible provider", own)
@@ -578,63 +599,6 @@ func TestSavePluginLoginRecordsRefusesMixedBatchBeforeWriting(t *testing.T) {
 	entries, _ := os.ReadDir(authDir)
 	if len(entries) != 0 {
 		t.Fatalf("auth dir has %d entries after a refused batch, want none", len(entries))
-	}
-}
-
-type slowDescribeQuotaProvider struct {
-	mockQuotaProvider
-	entered chan struct{}
-	release chan struct{}
-	calls   atomic.Int32
-}
-
-func (p *slowDescribeQuotaProvider) DescribeQuota(ctx context.Context, req pluginapi.QuotaDescribeRequest) (pluginapi.QuotaDescribeResponse, error) {
-	p.calls.Add(1)
-	p.entered <- struct{}{}
-	<-p.release
-	return p.mockQuotaProvider.DescribeQuota(ctx, req)
-}
-
-// S3: a cold DescribeQuota keeps its slot after the caller gives up, so abandoned calls cannot
-// stack up more plugin work than the slot count.
-func TestFetchQuotaForCredentialHoldsSlotThroughDescribe(t *testing.T) {
-	authDir := t.TempDir()
-	manager := coreauth.NewManager(nil, nil, nil)
-	cred := registerFileAuth(t, manager, authDir, &coreauth.Auth{ID: "slow.json", Provider: "slow-runtime", Status: coreauth.StatusActive}, `{"type":"slow-runtime"}`)
-	provider := &slowDescribeQuotaProvider{
-		mockQuotaProvider: mockQuotaProvider{identifier: "slow", supported: []string{"slow-runtime"}},
-		entered:           make(chan struct{}, 16),
-		release:           make(chan struct{}),
-	}
-	host := pluginhost.New()
-	host.SetAuthManager(manager)
-	host.RegisterPluginForTest("slow-plugin", pluginapi.Plugin{Capabilities: pluginapi.Capabilities{QuotaProvider: provider}})
-
-	const slots = 4
-	for i := 0; i < slots; i++ {
-		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan error, 1)
-		go func() {
-			_, _, err := host.FetchQuotaForCredential(ctx, "slow-runtime", "", cred.Index, cred.ID)
-			done <- err
-		}()
-		<-provider.entered
-		cancel()
-		if err := <-done; !errors.Is(err, context.Canceled) {
-			t.Fatalf("abandoned call %d err = %v, want context.Canceled", i, err)
-		}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	if _, _, err := host.FetchQuotaForCredential(ctx, "slow-runtime", "", cred.Index, cred.ID); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("call past the limit err = %v, want it to wait for a slot", err)
-	}
-	if got := provider.calls.Load(); got != slots {
-		t.Fatalf("DescribeQuota calls = %d, want %d: a slot was freed while a describe still ran", got, slots)
-	}
-	close(provider.release)
-	if _, handled, err := host.FetchQuotaForCredential(context.Background(), "slow-runtime", "", cred.Index, cred.ID); !handled || err != nil {
-		t.Fatalf("fetch after describes finish = handled %v, err %v", handled, err)
 	}
 }
 

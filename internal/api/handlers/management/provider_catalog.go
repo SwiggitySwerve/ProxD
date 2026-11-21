@@ -15,6 +15,7 @@ import (
 
 	"github.com/MoeForge/moego/json"
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/kimi"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/htmlsanitize"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
@@ -311,8 +312,15 @@ func (h *Handler) signInProviderID(auth *coreauth.Auth) string {
 	runtimeID := canonicalBuiltinProviderKey(auth.Provider)
 	switch runtimeID {
 	case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
-		// Built-in Kimi picks its sign-in entry from the credential's domain.
-		return canonicalBuiltinProviderKey(h.resolveTargetOAuthProvider(auth))
+		// Built-in Kimi picks its sign-in entry from the credential's domain alone.
+		if kimi.IsKimiAIAuth(auth) {
+			return "kimi-ai"
+		}
+		return "kimi"
+	}
+	if _, builtin := findBuiltinOAuthProvider(runtimeID); builtin {
+		// Built-in login dispatch wins over plugins, so no portal hint relabels it.
+		return runtimeID
 	}
 	h.mu.Lock()
 	host := h.pluginHost
@@ -734,8 +742,11 @@ func (h *Handler) GetProviderCatalogV8(c *gin.Context) {
 			Credentials: creds,
 			Quota:       resolveQuota(providerID, false, false),
 		}
+		// Native providers keep their built-in executor even when a plugin extends them, as
+		// executor registration does, so they stay built-in.
 		ownerPluginID := ""
-		if host != nil {
+		native := nativeRuntimeProviders[providerID] || nativeProviders[providerID]
+		if host != nil && !native {
 			ownerPluginID = host.AuthProviderPluginID(providerID)
 			if ownerPluginID == "" {
 				ownerPluginID = quotaPluginIDs[providerID]
@@ -748,7 +759,7 @@ func (h *Handler) GetProviderCatalogV8(c *gin.Context) {
 			entry.Source = "plugin"
 			entry.PluginID = nonEmptyStringPtr(htmlsanitize.String(ownerPluginID))
 			entry.DisplayName = catalogDisplayName(pluginNames[ownerPluginID], entry.DisplayName)
-		} else if !nativeRuntimeProviders[providerID] && !nativeProviders[providerID] {
+		} else if !native {
 			entry.Source = "plugin"
 			entry.Lifecycle = lifecycleDisabled
 		}

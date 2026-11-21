@@ -358,6 +358,7 @@ func TestFetchCredentialQuotaV8_BindingExtendedBucketsAndNoProbe(t *testing.T) {
 		Provider:   "example-plugin",
 		Status:     coreauth.StatusActive,
 		Attributes: map[string]string{coreauth.AttributePath: pluginPath},
+		Metadata:   map[string]any{"type": "example-plugin"},
 	})
 	if err != nil {
 		t.Fatalf("register plugin auth: %v", err)
@@ -445,9 +446,21 @@ func TestFetchCredentialQuotaV8_BindingExtendedBucketsAndNoProbe(t *testing.T) {
 	if bucket.ID != "five-hour" || bucket.PeriodSeconds == nil || *bucket.PeriodSeconds != 18000 || bucket.Scope != "account" {
 		t.Fatalf("extended bucket fields not preserved: %+v", bucket)
 	}
-	// The plugin gets the credential's own file bytes and runtime provider from one host lookup.
+	// The plugin gets the published record's own storage and runtime provider.
 	if string(gotReq.StorageJSON) != `{"type":"example-plugin"}` || gotReq.AuthID != "plugin-cred.json" || gotReq.Provider != "example-plugin" {
 		t.Fatalf("unexpected plugin request: id=%q provider=%q storage=%q", gotReq.AuthID, gotReq.Provider, gotReq.StorageJSON)
+	}
+	// A replacement file not yet published as a record never reaches the plugin.
+	if err := os.WriteFile(pluginPath, []byte(`{"type":"other-provider","access_token":"someone-else"}`), 0o600); err != nil {
+		t.Fatalf("replace file: %v", err)
+	}
+	recSwap := httptest.NewRecorder()
+	ctxSwap, _ := gin.CreateTestContext(recSwap)
+	ctxSwap.Request = httptest.NewRequest(http.MethodPost, "/v8/management/quota/fetch", strings.NewReader(`{"auth_index":"`+pluginAuth.Index+`"}`))
+	ctxSwap.Request.Header.Set("Content-Type", "application/json")
+	h.FetchCredentialQuotaV8(ctxSwap)
+	if recSwap.Code != http.StatusOK || string(gotReq.StorageJSON) != `{"type":"example-plugin"}` {
+		t.Fatalf("after file swap status = %d, storage = %q; want the record's storage", recSwap.Code, gotReq.StorageJSON)
 	}
 
 	// 2. Mismatched caller plugin_id is rejected with 403 Forbidden.
