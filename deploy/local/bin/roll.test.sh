@@ -44,7 +44,7 @@ ContainerName=proxd-$hub
 PublishPort=$port:8317
 EOF
   done
-  rm -rf "$T/data" "$T/calls" "$T/systemd-run.args" "$T/bad-hub" "$T/unsubscribed"
+  rm -rf "$T/data" "$T/calls" "$T/systemd-run.args" "$T/bad-hub" "$T/unsubscribed" "$T/unsub-hub" "$T/rebuilt"
   mkdir -p "$T/data"
   : >"$T/calls"
 }
@@ -73,9 +73,12 @@ EOF
 cat >"$T/stub/podman" <<'EOF'
 #!/usr/bin/env bash
 echo "podman $*" >>"$STUB/calls"
-case "$1 $2" in
-  "image exists") [ "$3" != localhost/proxd:missing ] ;;
-  "inspect --format") echo localhost/cli-proxy-api:legacy-alias ;;
+case "$1 $2 $3" in
+  "image exists "*) [ "$3" != localhost/proxd:missing ] ;;
+  "image inspect --format") echo "id-$5" ;;
+  "inspect --format {{.ImageName}}") echo localhost/cli-proxy-api:legacy-alias ;;
+  "inspect --format {{.Image}}") # the container runs its quadlet's image, unless rebuilt
+    if [ -f "$STUB/rebuilt" ]; then echo id-older-build; else echo "id-$(sed -n 's/^Image=//p' "$LIVE_UNIT_DIR/$4.container")"; fi ;;
 esac
 EOF
 # curl: a hub is down while its quadlet names the image in $STUB/bad-hub ("<hub> <image>").
@@ -94,6 +97,11 @@ case "$url" in
       v=1
       down "$h" && v=0
       [ -f "$STUB/unsubscribed" ] && grep -qx "$h" "$STUB/unsubscribed" && v=0
+      # "<hub> <image>": healthy, but its source never subscribes while on that image
+      if [ -f "$STUB/unsub-hub" ]; then
+        read -r uh ui <"$STUB/unsub-hub"
+        [ "$uh" = "$h" ] && grep -qxF "Image=$ui" "$LIVE_UNIT_DIR/proxd-$h.container" && v=0
+      fi
       echo "proxd_usage_source_subscribed{instance=\"$h-primary\"} $v"
     done
     cat "$STUB/filler" ;; # the real page is ~300 KB: a reader that stops early breaks the pipe
@@ -168,6 +176,8 @@ check "timers busy when rerank fired 30 s ago" grep -q "proxd-rerank.timer fired
 timers 600 -300
 echo activating >"$T/active-proxd-claude-ua-sync.service"
 check "timers busy while ua-sync runs" grep -q "proxd-claude-ua-sync.service is activating" <<<"$(quiet_reason "$NOW")"
+echo "" >"$T/active-proxd-claude-ua-sync.service"
+check "timers busy when a service state cannot be read" grep -q "proxd-claude-ua-sync.service is in an unknown state" <<<"$(quiet_reason "$NOW")"
 rm "$T/active-proxd-claude-ua-sync.service"
 (QUIET_TIMERS=gone.timer quiet_reason "$NOW" >/dev/null 2>&1) && bad "a missing timer fails closed" ||
   ok "a missing timer fails closed"
@@ -215,6 +225,22 @@ check "roll-all logs why it waited" has "$T/out" "proxd-codex waits: proxd-reran
 
 reset_units
 timers
+sed -i "s|^Image=.*|Image=localhost/proxd:missing|" "$T/units/proxd-gemini.container"
+"$BIN/roll-all.sh" --approved "$NEW" >"$T/out" 2>&1 && bad "roll-all refuses when a current image is gone" ||
+  ok "roll-all refuses when a current image is gone"
+check "roll-all with a current image gone restarted nothing" [ -z "$(restarts)" ]
+check "roll-all says which image is gone" has "$T/out" "proxd-gemini's current image localhost/proxd:missing is not present"
+
+reset_units
+timers
+sed -i "s|^Image=.*|Image=$NEW|" "$T/units/proxd-codex.container"
+touch "$T/rebuilt"
+"$BIN/roll-all.sh" --approved "$NEW" >"$T/out" 2>&1 && bad "roll-all refuses a rebuilt tag" || ok "roll-all refuses a rebuilt tag"
+check "roll-all with a rebuilt tag restarted nothing" [ -z "$(restarts)" ]
+check "roll-all says the tag was rebuilt" has "$T/out" "was the tag rebuilt?"
+
+reset_units
+timers
 "$BIN/roll-all.sh" --approved "$NEW" >"$T/out" 2>&1 && ok "roll-all succeeds" || { bad "roll-all succeeds"; cat "$T/out"; }
 check "roll-all ran in systemd-run --wait" grep -qF -- "--user --wait --collect" "$T/systemd-run.args"
 check "roll-all unit has idle IO and nice 10" grep -qF -- "-p IOSchedulingClass=idle -p Nice=10" "$T/systemd-run.args"
@@ -245,6 +271,17 @@ rm "$T/bad-hub"
 "$BIN/roll-all.sh" --approved "$NEW" >"$T/out" 2>&1 && ok "roll-all re-run succeeds" || { bad "roll-all re-run succeeds"; cat "$T/out"; }
 check "roll-all re-run skips the hub already rolled" has "$T/out" "proxd-codex is already on $NEW; skipped"
 check "roll-all re-run restarts only the rest" [ "$(restarts)" = "restart proxd-claude restart proxd-gemini " ]
+
+reset_units
+timers
+echo "claude $NEW" >"$T/unsub-hub"
+SUBSCRIBE_TIMEOUT=1 "$BIN/roll-all.sh" --approved "$NEW" >"$T/out2" 2>&1 && bad "roll-all fails when a source does not subscribe" ||
+  ok "roll-all fails when a source does not subscribe"
+check "roll-all rolled back the healthy but unsubscribed hub" [ "$(img claude)" = "$OLD" ]
+check "roll-all did not touch the hub after it" [ "$(img gemini)" = "$OLD" ]
+check "roll-all after a subscription failure never restarted gemini" [ "$(restarts)" = "restart proxd-codex restart proxd-claude restart proxd-claude " ]
+check "roll-all reports the subscription failure" has "$T/out2" "proxd-claude FAILED health or subscription"
+rm "$T/unsub-hub"
 
 echo "$PASSES passed, $FAILS failed"
 [ "$FAILS" = 0 ]

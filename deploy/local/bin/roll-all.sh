@@ -80,7 +80,7 @@ quiet_reason() {
       return
     fi
     state=$(systemctl --user is-active "$svc" || true)
-    case "$state" in active | activating | deactivating | reloading) echo "$svc is $state"; return ;; esac
+    case "$state" in inactive | failed) ;; *) echo "$svc is ${state:-in an unknown state}"; return ;; esac
   done
 }
 
@@ -94,12 +94,11 @@ subscribed() { # subscribed <instance>
 }
 
 wait_subscribed() { # wait_subscribed <instance>
-  local i
-  for ((i = 0; i < SUBSCRIBE_TIMEOUT / 3; i++)); do
-    subscribed "$1" && return 0
+  local deadline=$((SECONDS + SUBSCRIBE_TIMEOUT))
+  until subscribed "$1"; do
+    [ "$SECONDS" -lt "$deadline" ] || return 1
     sleep 3
   done
-  return 1
 }
 
 unit_path() { echo "$UNIT_DIR/proxd-$1.container"; }
@@ -257,8 +256,19 @@ main() {
 
   exec 8>"$DATA_ROOT/roll-all/lock"
   flock -n 8 || die "another roll-all.sh run holds $DATA_ROOT/roll-all/lock"
+  read_quadlets # again, under the lock: a run that just finished may have changed them
   podman image exists "$IMAGE" || die "image $IMAGE not found locally; refusing to roll"
-  local hub
+  local hub running_id
+  for hub in $HUBS; do
+    if [ "${PREV[$hub]}" = "$IMAGE" ]; then
+      # Skipped below, so it must really run this image, not an older build of the same tag.
+      running_id=$(podman inspect --format '{{.Image}}' "proxd-$hub" 2>/dev/null || true)
+      [ "$running_id" = "$(podman image inspect --format '{{.Id}}' "$IMAGE")" ] ||
+        die "proxd-$hub's quadlet names $IMAGE but its container runs another image (was the tag rebuilt?); roll a new tag"
+    else
+      podman image exists "${PREV[$hub]}" || die "proxd-$hub's current image ${PREV[$hub]} is not present locally, so it could not be rolled back; refusing to roll"
+    fi
+  done
   # The check after each roll cannot pass if a source is down before it: refuse instead
   # of rolling back a healthy hub.
   for hub in $HUBS; do

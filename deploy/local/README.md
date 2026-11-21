@@ -154,7 +154,7 @@ this script.
 ### All three hubs: one command
 
 ```bash
-deploy/local/bin/roll-all.sh --dry-run <image-tag>     # reads quadlets, timers, exporter; prints the plan
+deploy/local/bin/roll-all.sh --dry-run <image-tag>     # reads the quadlets and timers; prints the plan
 deploy/local/bin/roll-all.sh --approved <image-tag>    # rolls codex, then claude, then gemini
 ```
 
@@ -185,7 +185,9 @@ refuses an image that is not present locally. No step is done by hand:
   then matches: `curl | grep -q` under `pipefail` fails when grep stops early (curl gets
   EPIPE on the ~300 KB page and exits 23), which once rolled back a healthy hub. Before
   touching anything it checks that all three sources are subscribed, so an exporter
-  outage cannot make it roll back a good hub.
+  outage cannot make it roll back a good hub, and that each hub's current image is still
+  present locally, so the rollback can work. A hub already on `<image-tag>` must run that
+  very image: a rebuilt tag is refused, as it cannot be rolled back.
 - **Stop on failure.** If a hub fails either check, it rolls that hub back to the `Image=`
   line read from its quadlet before the roll (at once: a broken hub does not wait for a
   quiet moment), reports whether `/healthz` answers again,
