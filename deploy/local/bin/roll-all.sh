@@ -16,7 +16,9 @@
 #     `systemctl --user list-timers`: those timers are OnUnitActiveSec timers, so the
 #     minute they fire at moves with every boot and every run.
 #   - After each hub it waits for /healthz (roll.sh) and then for the exporter line
-#     proxd_usage_source_subscribed{instance="<CLIPROXY_INSTANCE_ID>"} 1.
+#     proxd_usage_source_subscribed{instance="<CLIPROXY_INSTANCE_ID>"} 1 together with a
+#     proxd_usage_source_subscribed_timestamp_seconds later than the one read before the
+#     restart, so a stale gauge from before the restart cannot pass.
 #   - On any failure it rolls that hub back to the Image= line read from its quadlet
 #     before the roll, and stops. Hubs not yet reached are not touched.
 #
@@ -93,9 +95,34 @@ subscribed() { # subscribed <instance>
   grep -qxF "proxd_usage_source_subscribed{instance=\"$1\"} 1" <<<"$page"
 }
 
-wait_subscribed() { # wait_subscribed <instance>
+subscribed_at() { # subscribed_at <instance>: unix seconds, NaN while not subscribed
+  local page
+  page=$(curl -fsS -m 5 "$EXPORTER_URL" 2>/dev/null) || return 1
+  awk -v k="proxd_usage_source_subscribed_timestamp_seconds{instance=\"$1\"}" \
+    '$1 == k { print $2; found = 1; exit } END { exit !found }' <<<"$page"
+}
+
+# resubscribed <instance> <before>: subscribed, at a time later than <before>, the
+# subscription time read before the restart. The gauge alone can be stale: on 21 Nov 2026 it
+# read 1 in the same second each hub came back. A usage event is no proof either: quiet hubs
+# go hours without one. A NaN <before> (not subscribed then) passes any finite time.
+resubscribed() {
+  local page
+  page=$(curl -fsS -m 5 "$EXPORTER_URL" 2>/dev/null) || return 1
+  awk -v i="{instance=\"$1\"}" -v before="$2" '
+    $1 == "proxd_usage_source_subscribed" i { s = $2 }
+    $1 == "proxd_usage_source_subscribed_timestamp_seconds" i { at = $2 }
+    END {
+      num = "^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$"
+      if (s != "1" || at !~ num) exit 1
+      if (before == "NaN") exit 0
+      exit !(before ~ num && at + 0 > before + 0)
+    }' <<<"$page"
+}
+
+wait_subscribed() { # wait_subscribed <instance> <before>
   local deadline=$((SECONDS + SUBSCRIBE_TIMEOUT))
-  until subscribed "$1"; do
+  until resubscribed "$1" "$2"; do
     [ "$SECONDS" -lt "$deadline" ] || return 1
     sleep 3
   done
@@ -147,16 +174,19 @@ wait_quiet() { # wait_quiet <hub>
 }
 
 roll_hub() { # roll_hub <hub>
-  local hub=$1 prev=${PREV[$1]}
+  local hub=$1 prev=${PREV[$1]} before
   if [ "$prev" = "$IMAGE" ]; then
     log "proxd-$hub is already on $IMAGE; skipped"
     return
   fi
   wait_quiet "$hub"
+  before=$(subscribed_at "${INSTANCE[$hub]}") ||
+    stop "before proxd-$hub: cannot read the subscription time of ${INSTANCE[$hub]} on $EXPORTER_URL"
   log "roll proxd-$hub: $prev -> $IMAGE"
-  if "$ROLL" --approved "$hub" "$IMAGE" && log "waiting for ${INSTANCE[$hub]} to be subscribed" &&
-    wait_subscribed "${INSTANCE[$hub]}"; then
-    log "proxd-$hub on $IMAGE: /healthz ok, ${INSTANCE[$hub]} subscribed"
+  if "$ROLL" --approved "$hub" "$IMAGE" &&
+    log "waiting for ${INSTANCE[$hub]} to subscribe again (subscribed at $before before the restart)" &&
+    wait_subscribed "${INSTANCE[$hub]}" "$before"; then
+    log "proxd-$hub on $IMAGE: /healthz ok, ${INSTANCE[$hub]} subscribed again"
     ROLLED+=("$hub")
     return
   fi
@@ -196,7 +226,7 @@ dry_run() {
       continue
     fi
     "$ROLL" --dry-run "$hub" "$IMAGE" | sed 's/^/  /'
-    echo "  then wait: proxd_usage_source_subscribed{instance=\"${INSTANCE[$hub]}\"} 1 on $EXPORTER_URL"
+    echo "  then wait: proxd_usage_source_subscribed{instance=\"${INSTANCE[$hub]}\"} 1 and a newer subscribed_timestamp_seconds on $EXPORTER_URL"
   done
   echo "rollback (state before the run):"
   # shellcheck disable=SC2086
@@ -271,6 +301,8 @@ main() {
   # of rolling back a healthy hub.
   for hub in $HUBS; do
     subscribed "${INSTANCE[$hub]}" || die "${INSTANCE[$hub]} is not subscribed on $EXPORTER_URL before the roll; fix that first"
+    subscribed_at "${INSTANCE[$hub]}" >/dev/null ||
+      die "$EXPORTER_URL has no proxd_usage_source_subscribed_timestamp_seconds for ${INSTANCE[$hub]}, so a reconnect after the restart cannot be proven; deploy the new prox-usage and proxd-exporter first"
   done
   log "roll-all to $IMAGE; Image= lines before the run, to undo it by hand:"
   # shellcheck disable=SC2086

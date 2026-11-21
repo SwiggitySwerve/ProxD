@@ -44,7 +44,7 @@ ContainerName=proxd-$hub
 PublishPort=$port:8317
 EOF
   done
-  rm -rf "$T/data" "$T/calls" "$T/systemd-run.args" "$T/bad-hub" "$T/unsubscribed" "$T/unsub-hub" "$T/rebuilt"
+  rm -rf "$T/data" "$T/calls" "$T/systemd-run.args" "$T/bad-hub" "$T/unsubscribed" "$T/unsub-hub" "$T/rebuilt" "$T/stale-ts" "$T/no-ts"
   mkdir -p "$T/data"
   : >"$T/calls"
 }
@@ -104,6 +104,14 @@ case "$url" in
         [ "$uh" = "$h" ] && grep -qxF "Image=$ui" "$LIVE_UNIT_DIR/proxd-$h.container" && v=0
       fi
       echo "proxd_usage_source_subscribed{instance=\"$h-primary\"} $v"
+      # Subscription time: one second later per restart of the hub, unless the hub is named
+      # in $STUB/stale-ts; NaN while unsubscribed; no series at all with $STUB/no-ts.
+      [ ! -f "$STUB/no-ts" ] || continue
+      n=$(grep -c "restart proxd-$h\." "$STUB/calls")
+      [ -f "$STUB/stale-ts" ] && grep -qx "$h" "$STUB/stale-ts" && n=0
+      ts=$((1763700000 + n)).5
+      [ "$v" = 1 ] || ts=NaN
+      echo "proxd_usage_source_subscribed_timestamp_seconds{instance=\"$h-primary\"} $ts"
     done
     cat "$STUB/filler" ;; # the real page is ~300 KB: a reader that stops early breaks the pipe
   */healthz) down "$(hub_of "$url")" && exit 7; exit 0 ;;
@@ -197,6 +205,17 @@ check "subscribed reads the body first and passes" bash -c "$(declare -f subscri
 echo gemini >"$T/unsubscribed"
 check "subscribed is false for a 0 line" bash -c "$(declare -f subscribed); EXPORTER_URL=$EXPORTER_URL; set -euo pipefail; ! subscribed gemini-primary"
 check "subscribed is false for an unknown instance" bash -c "$(declare -f subscribed); EXPORTER_URL=$EXPORTER_URL; set -euo pipefail; ! subscribed codex"
+fns="$(declare -f subscribed_at resubscribed); EXPORTER_URL=$EXPORTER_URL; set -euo pipefail"
+check "subscribed_at reads the subscription time" bash -c "$fns; [ \"\$(subscribed_at codex-primary)\" = 1763700000.5 ]"
+check "subscribed_at is NaN while not subscribed" bash -c "$fns; [ \"\$(subscribed_at gemini-primary)\" = NaN ]"
+check "resubscribed passes a time later than before" bash -c "$fns; resubscribed codex-primary 1763699999.5"
+check "resubscribed refuses an unchanged time" bash -c "$fns; ! resubscribed codex-primary 1763700000.5"
+check "resubscribed refuses an older time" bash -c "$fns; ! resubscribed codex-primary 1763700001"
+check "resubscribed after a NaN before passes any finite time" bash -c "$fns; resubscribed codex-primary NaN"
+check "resubscribed refuses an unsubscribed source after a NaN before" bash -c "$fns; ! resubscribed gemini-primary NaN"
+touch "$T/no-ts"
+check "subscribed_at fails without the series" bash -c "$fns; ! subscribed_at codex-primary"
+check "resubscribed fails without the series" bash -c "$fns; ! resubscribed codex-primary NaN"
 
 # --- roll-all.sh ---------------------------------------------------------------
 reset_units
@@ -264,6 +283,7 @@ check "roll-all records each hub under its data dir" \
   bash -c 'ls "$1"/codex/rollback/codex-*.txt "$1"/claude/rollback/claude-*.txt "$1"/gemini/rollback/gemini-*.txt >/dev/null' _ "$T/data"
 log=$(ls "$T/data/roll-all/"*.log 2>/dev/null || echo /nonexistent)
 check "roll-all writes a log file" has "$log" "ROLL-ALL COMPLETE"
+check "roll-all passes each hub on a fresh subscription time" has "$log" "gemini-primary subscribed again"
 check "roll-all output shows the log" has "$T/out" "ROLL-ALL COMPLETE"
 check "roll-all prints the rollback commands" has "$log" "$BIN/roll.sh --approved claude $OLD"
 
@@ -295,6 +315,27 @@ check "roll-all did not touch the hub after it" [ "$(img gemini)" = "$OLD" ]
 check "roll-all after a subscription failure never restarted gemini" [ "$(restarts)" = "restart proxd-codex restart proxd-claude restart proxd-claude " ]
 check "roll-all reports the subscription failure" has "$T/out2" "proxd-claude FAILED health or subscription"
 rm "$T/unsub-hub"
+
+# The gauge still reads 1 after the restart, but the subscription time has not moved.
+reset_units
+timers
+echo claude >"$T/stale-ts"
+SUBSCRIBE_TIMEOUT=1 "$BIN/roll-all.sh" --approved "$NEW" >"$T/out" 2>&1 && bad "roll-all fails on a stale subscription time" ||
+  ok "roll-all fails on a stale subscription time"
+check "roll-all rolled back the hub with a stale subscription time" [ "$(img claude)" = "$OLD" ]
+check "roll-all after a stale subscription time did not touch the hub after it" [ "$(img gemini)" = "$OLD" ]
+check "roll-all after a stale subscription time never restarted gemini" [ "$(restarts)" = "restart proxd-codex restart proxd-claude restart proxd-claude " ]
+check "roll-all reports the stale subscription as a failure" has "$T/out" "proxd-claude FAILED health or subscription"
+check "roll-all logs the time it compared against" has "$T/out" "(subscribed at 1763700000.5 before the restart)"
+
+# An exporter or prox-usage from before the subscription time series.
+reset_units
+timers
+touch "$T/no-ts"
+"$BIN/roll-all.sh" --approved "$NEW" >"$T/out" 2>&1 && bad "roll-all refuses without the subscription time series" ||
+  ok "roll-all refuses without the subscription time series"
+check "roll-all without the subscription time series restarted nothing" [ -z "$(restarts)" ]
+check "roll-all says to deploy the new prox-usage and exporter" has "$T/out" "deploy the new prox-usage and proxd-exporter first"
 
 echo "$PASSES passed, $FAILS failed"
 [ "$FAILS" = 0 ]
