@@ -100,8 +100,8 @@ against `/backend-api/wham/usage`. It is cleared through `Manager.ResetQuota` on
 when `rate_limit.allowed` is true and `limit_reached` is false. Failed, non-200 or
 incomplete probes keep the cooldown. Disabled credentials are never probed.
 Providers plug in through `QuotaRecheckAdapter` (`quota_recheck.go`, registered per
-provider with `Manager.RegisterQuotaRecheckAdapter`; `NewManager` registers the Codex and Claude
-adapters from the provider registry, `provider_registry.go`). A cooldown is
+provider with `Manager.RegisterQuotaRecheckAdapter`; `NewManager` registers the Codex, Claude and
+Antigravity adapters from the provider registry, `provider_registry.go`). A cooldown is
 cleared only if it is still the one the probe observed (recover time, credential
 version and epoch unchanged), so a newer cooldown set mid-probe survives.
 Tests: `quota_reconcile_test.go`, `quota_recheck_test.go`.
@@ -158,6 +158,28 @@ short backoff.
   still means Codex only.
 
 Tests: `quota_recheck_claude_test.go`.
+
+### Antigravity adapter
+
+`quota_recheck_antigravity.go`, registered for `antigravity` at the slow default cadence. A
+429 stores the reset Google named then, but an upgrade (Google AI Ultra Lite to Ultra) starts
+fresh windows at once; before this adapter the hub kept the stale cooldown until the old reset.
+
+- Verdict: `POST /v1internal:retrieveUserQuotaSummary` with the credential's `project_id`,
+  through the executor. The summary groups models by family ("Gemini Models", "Claude and GPT
+  models"), each group with weekly and five-hour buckets. Each cooled model maps to its group
+  by id prefix (`gemini-`, `claude-`, `gpt-`); a `credential_quota` cooldown, or one no model
+  state explains, needs every group. Allowed needs `remainingFraction` above 0 in every bucket of
+  every needed group; a missing fraction counts as spent (the summary omits zeros). A spent
+  bucket is limited. A cooled model with no known family, a missing group, an empty summary or
+  any non-200 keeps the cooldown. A clear goes through the same guarded `resetQuota`.
+- Usage snapshot: the stored observation, no upstream call (as Codex).
+- When every candidate is cooled (always, on a one-credential Gemini instance), the all-cooled
+  round below runs this verdict on the next request, so a reset or upgrade is picked up by that
+  request (at most once per 60s per credential).
+- Enable with `quota-reconcile: {antigravity: {mode: clear}}` on the Gemini instance.
+
+Tests: `quota_recheck_antigravity_test.go`.
 
 ### All-cooled recheck round
 
