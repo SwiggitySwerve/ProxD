@@ -83,6 +83,9 @@ func init() {
 		// only by quotaProbeMinGap.
 		recheckCadence: &quotaRecheckCadence{interval: quotaProbeMinGap, nearInterval: quotaProbeMinGap},
 	})
+	// Antigravity is rechecked against Google's quota summary
+	// (quota_recheck_antigravity.go), at the slow default cadence.
+	registerProviderQuota("antigravity", providerQuota{recheck: antigravityQuotaRecheckAdapter{}})
 	// Devin observes, but no Devin header is on the signal allowlist yet, so a
 	// response never replaces its snapshot.
 	registerProviderQuota("devin", providerQuota{observes: true})

@@ -27,7 +27,12 @@ func TestProviderQuotaCharacterizationRecheckAdapters(t *testing.T) {
 			t.Fatalf("adapter for %q = %T, want codexQuotaRecheckAdapter", provider, manager.quotaRecheckAdapter(provider))
 		}
 	}
-	for _, provider := range []string{"", "devin", "gemini", "xai", "antigravity", "kimi"} {
+	for _, provider := range []string{"antigravity", " Antigravity "} {
+		if _, ok := manager.quotaRecheckAdapter(provider).(antigravityQuotaRecheckAdapter); !ok {
+			t.Fatalf("adapter for %q = %T, want antigravityQuotaRecheckAdapter", provider, manager.quotaRecheckAdapter(provider))
+		}
+	}
+	for _, provider := range []string{"", "devin", "gemini", "xai", "kimi"} {
 		if adapter := manager.quotaRecheckAdapter(provider); adapter != nil {
 			t.Fatalf("adapter for %q = %T, want none", provider, adapter)
 		}
