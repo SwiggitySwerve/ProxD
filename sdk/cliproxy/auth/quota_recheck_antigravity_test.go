@@ -102,6 +102,8 @@ func TestAntigravityRecheckKeepsCooldownWhileItsGroupIsSpent(t *testing.T) {
 		"fraction omitted":  antigravitySummary("", "0.5", "1"),
 		"no groups":         `{"groups":[]}`,
 		"no matching group": `{"groups":[{"displayName":"Claude and GPT models","buckets":[{"bucketId":"3p-5h","remainingFraction":1}]}]}`,
+		"boolean fraction":  antigravitySummary("true", "0.5", "1"),
+		"string fraction":   antigravitySummary(`"NaN"`, "0.5", "1"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			exec := &antigravityProbeExecutor{usageProbeExecutor: &usageProbeExecutor{status: http.StatusOK, body: summary}}
@@ -140,6 +142,19 @@ func TestAntigravityRecheckKeepsCooldownOnUnusableProbe(t *testing.T) {
 		manager.reconcileQuotaCooldowns(context.Background())
 		if !antigravityCooled(t, manager, id) {
 			t.Fatalf("cooldown cleared on a failed probe")
+		}
+	})
+	t.Run("expired cooldown on another family", func(t *testing.T) {
+		exec := &antigravityProbeExecutor{usageProbeExecutor: &usageProbeExecutor{status: http.StatusOK, body: antigravitySummary("1", "1", "0")}}
+		manager, id := newAntigravityCooledManager(t, exec, "gemini-4-neon-xhigh", "claude-opus-5-5-high")
+		got, _ := manager.GetByID(id)
+		got.ModelStates["claude-opus-5-5-high"].Quota.NextRecoverAt = time.Now().Add(-time.Minute)
+		if _, err := manager.Update(context.Background(), got); err != nil {
+			t.Fatalf("update: %v", err)
+		}
+		manager.reconcileQuotaCooldowns(context.Background())
+		if got, _ := manager.GetByID(id); isModelStateActiveCooldown(got.ModelStates["gemini-4-neon-xhigh"], time.Now()) {
+			t.Fatalf("Gemini cooldown kept because an expired Claude cooldown asked for the spent Claude/GPT group")
 		}
 	})
 	t.Run("unknown model family", func(t *testing.T) {

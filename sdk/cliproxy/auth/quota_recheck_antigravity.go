@@ -38,7 +38,7 @@ func (antigravityQuotaRecheckAdapter) UsageSnapshot(_ context.Context, _ QuotaRe
 }
 
 func (antigravityQuotaRecheckAdapter) Verdict(ctx context.Context, host QuotaRecheckHost, auth *Auth) (QuotaVerdict, error) {
-	families, err := antigravityCooledFamilies(auth)
+	families, err := antigravityCooledFamilies(auth, time.Now())
 	if err != nil {
 		return QuotaVerdict{}, err
 	}
@@ -71,18 +71,20 @@ func (antigravityQuotaRecheckAdapter) Verdict(ctx context.Context, host QuotaRec
 }
 
 // antigravityCooledFamilies returns the model families whose quota groups must
-// be open before the credential's cooldowns may clear. A credential-wide
+// be open before the credential's live cooldowns may clear. A credential-wide
 // cooldown, or one no model state explains, needs every group, reported as a
 // nil slice. A model 429 also marks the credential's aggregate quota, so only
-// a credential_quota reason counts as credential-wide.
-func antigravityCooledFamilies(auth *Auth) ([]string, error) {
-	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" {
+// a credential_quota reason counts as credential-wide. Expired cooldowns block
+// nothing and are ignored.
+func antigravityCooledFamilies(auth *Auth, now time.Time) ([]string, error) {
+	live := func(quota QuotaState) bool { return quota.Exceeded && quota.NextRecoverAt.After(now) }
+	if live(auth.Quota) && auth.Quota.Reason == "credential_quota" {
 		return nil, nil
 	}
 	seen := make(map[string]bool)
 	var families []string
 	for model, state := range auth.ModelStates {
-		if state == nil || !state.Quota.Exceeded {
+		if state == nil || !live(state.Quota) {
 			continue
 		}
 		family := antigravityQuotaFamily(model)
@@ -95,10 +97,10 @@ func antigravityCooledFamilies(auth *Auth) ([]string, error) {
 		}
 	}
 	if len(families) == 0 {
-		if auth.Quota.Exceeded {
+		if live(auth.Quota) {
 			return nil, nil
 		}
-		return nil, errors.New("credential holds no quota cooldown")
+		return nil, errors.New("credential holds no live quota cooldown")
 	}
 	return families, nil
 }
@@ -116,8 +118,8 @@ func antigravityQuotaFamily(model string) string {
 }
 
 // antigravitySummaryVerdict judges a retrieveUserQuotaSummary body. families
-// nil means every group counts. A bucket without remainingFraction is spent:
-// the summary omits zero values.
+// nil means every group counts. Only a numeric remainingFraction above 0 is
+// quota left; a missing one is spent (the summary omits zero values).
 func antigravitySummaryVerdict(body []byte, families []string) (QuotaVerdict, error) {
 	groups := ojson.GetBytes(body, "groups").Array()
 	if len(groups) == 0 {
@@ -144,7 +146,7 @@ func antigravitySummaryVerdict(body []byte, families []string) (QuotaVerdict, er
 		for _, bucket := range buckets {
 			fraction := bucket.Get("remainingFraction")
 			verdict.Signals[bucket.Get("bucketId").String()] = fraction.String()
-			if fraction.Float() <= 0 {
+			if fraction.Type != ojson.Number || !(fraction.Num > 0) {
 				verdict.State = QuotaVerdictLimited
 			}
 		}
