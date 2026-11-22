@@ -407,6 +407,37 @@ class ExporterUsageHealth(unittest.TestCase):
                     data["sources"][0][key] = bad
                     self.assertEqual(set(self.health_values(data, raises=ValueError)), {'proxd_up{service="usage"}'})
 
+    def test_subscription_boot_id_is_an_info_series_only_while_subscribed(self):
+        data = health_payload()
+        data["sources"][0]["subscribed_boot_id"] = "0f8e2c1a-4b6d-4e9a-8c3b-2d1f0a9e7b6c"
+        data["sources"][1]["subscribed_boot_id"] = None  # not subscribed
+        values = self.health_values(data)
+        self.assertEqual(values['proxd_usage_source_subscribed_boot_info{instance="claude-primary",'
+                                'boot_id="0f8e2c1a-4b6d-4e9a-8c3b-2d1f0a9e7b6c"}'], 1)
+        self.assertEqual([k for k in values if k.startswith("proxd_usage_source_subscribed_boot_info")],
+                         ['proxd_usage_source_subscribed_boot_info{instance="claude-primary",'
+                          'boot_id="0f8e2c1a-4b6d-4e9a-8c3b-2d1f0a9e7b6c"}'])
+        self.assertEqual(values['proxd_usage_source_subscribed{instance="codex-primary"}'], 0)
+
+    def test_subscription_boot_id_label_is_escaped(self):
+        data = health_payload()
+        data["sources"][0]["subscribed_boot_id"] = 'a"b\\c'
+        values = self.health_values(data)
+        self.assertEqual(values['proxd_usage_source_subscribed_boot_info{instance="claude-primary",boot_id="a\\"b\\\\c"}'], 1)
+
+    def test_usage_service_without_subscription_boot_id_adds_no_series(self):
+        values = self.health_values(health_payload())  # an older prox-usage has no such key
+        self.assertFalse(any(k.startswith("proxd_usage_source_subscribed_boot_info") for k in values))
+        self.assertEqual(values['proxd_usage_source_subscribed{instance="claude-primary"}'], 1)
+        self.assertEqual(values['proxd_usage_source_last_event_age_seconds{instance="claude-primary"}'], 1.5)
+
+    def test_malformed_subscription_boot_id_rejects_the_health_block_like_a_bad_time(self):
+        for bad in (True, 1, 1.5, "", ["0f8e2c1a"], {"id": "0f8e2c1a"}):
+            with self.subTest(bad=bad):
+                data = health_payload()
+                data["sources"][0]["subscribed_boot_id"] = bad
+                self.assertEqual(set(self.health_values(data, raises=ValueError)), {'proxd_up{service="usage"}'})
+
     def test_malformed_job_fields_keep_source_health_and_raise_the_flag(self):
         good = {"last_success_seconds": 1700000100, "last_failure_seconds": None}
         cases = [("jobs", []), ("jobs", None)] + [("jobs", {"import": bad}) for bad in (

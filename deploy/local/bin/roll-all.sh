@@ -18,7 +18,9 @@
 #   - After each hub it waits for /healthz (roll.sh) and then for the exporter line
 #     proxd_usage_source_subscribed{instance="<CLIPROXY_INSTANCE_ID>"} 1 together with a
 #     proxd_usage_source_subscribed_timestamp_seconds later than the one read before the
-#     restart, so a stale gauge from before the restart cannot pass.
+#     restart, so a stale gauge from before the restart cannot pass, and a
+#     proxd_usage_source_subscribed_boot_info boot id other than the one read before the
+#     restart, so a reconnect to the old hub process before it stopped cannot pass either.
 #   - On any failure it rolls that hub back to the Image= line read from its quadlet
 #     before the roll, and stops. Hubs not yet reached are not touched.
 #
@@ -102,27 +104,47 @@ subscribed_at() { # subscribed_at <instance>: unix seconds, NaN while not subscr
     '$1 == k { print $2; found = 1; exit } END { exit !found }' <<<"$page"
 }
 
-# resubscribed <instance> <before>: subscribed, at a time later than <before>, the
-# subscription time read before the restart. The gauge alone can be stale: on 21 Nov 2026 it
-# read 1 in the same second each hub came back. A usage event is no proof either: quiet hubs
-# go hours without one. A NaN <before> (not subscribed then) passes any finite time.
+# subscribed_boot <instance>: the boot id of the hub process the source is subscribed to, as
+# the exporter's escaped label value; nothing while it is not subscribed, or when prox-usage
+# or the exporter predates the series.
+subscribed_boot() {
+  local page
+  page=$(curl -fsS -m 5 "$EXPORTER_URL" 2>/dev/null) || return 1
+  awk -v p="proxd_usage_source_subscribed_boot_info{instance=\"$1\",boot_id=\"" '
+    index($0, p) == 1 && substr($0, length($0) - 3) == "\"} 1" {
+      print substr($0, length(p) + 1, length($0) - length(p) - 4); exit
+    }' <<<"$page"
+}
+
+# resubscribed <instance> <before> <before_boot>: subscribed, at a time later than <before>,
+# the subscription time read before the restart, to a hub boot id other than <before_boot>,
+# the one read then. The gauge alone can be stale: on 21 Nov 2026 it read 1 in the same
+# second each hub came back. A usage event is no proof either: quiet hubs go hours without
+# one. The time alone is not proof either: a source that reconnects to the old process
+# between the read and the restart gets a later time but keeps the old boot id. A NaN
+# <before> and an empty <before_boot> (not subscribed then) pass any time and boot id.
 resubscribed() {
   local page
   page=$(curl -fsS -m 5 "$EXPORTER_URL" 2>/dev/null) || return 1
-  awk -v i="{instance=\"$1\"}" -v before="$2" '
+  # The boot id goes through the environment: awk -v would undo backslash escapes in it.
+  BEFORE_BOOT=$3 awk -v i="{instance=\"$1\"}" -v before="$2" \
+    -v p="proxd_usage_source_subscribed_boot_info{instance=\"$1\",boot_id=\"" '
     $1 == "proxd_usage_source_subscribed" i { s = $2 }
     $1 == "proxd_usage_source_subscribed_timestamp_seconds" i { at = $2 }
+    index($0, p) == 1 && substr($0, length($0) - 3) == "\"} 1" {
+      boot = substr($0, length(p) + 1, length($0) - length(p) - 4)
+    }
     END {
       num = "^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$"
-      if (s != "1" || at !~ num) exit 1
+      if (s != "1" || at !~ num || boot == "" || boot == ENVIRON["BEFORE_BOOT"]) exit 1
       if (before == "NaN") exit 0
       exit !(before ~ num && at + 0 > before + 0)
     }' <<<"$page"
 }
 
-wait_subscribed() { # wait_subscribed <instance> <before>
+wait_subscribed() { # wait_subscribed <instance> <before> <before_boot>
   local deadline=$((SECONDS + SUBSCRIBE_TIMEOUT))
-  until resubscribed "$1" "$2"; do
+  until resubscribed "$1" "$2" "$3"; do
     [ "$SECONDS" -lt "$deadline" ] || return 1
     sleep 3
   done
@@ -174,7 +196,7 @@ wait_quiet() { # wait_quiet <hub>
 }
 
 roll_hub() { # roll_hub <hub>
-  local hub=$1 prev=${PREV[$1]} before
+  local hub=$1 prev=${PREV[$1]} before before_boot
   if [ "$prev" = "$IMAGE" ]; then
     log "proxd-$hub is already on $IMAGE; skipped"
     return
@@ -182,10 +204,12 @@ roll_hub() { # roll_hub <hub>
   wait_quiet "$hub"
   before=$(subscribed_at "${INSTANCE[$hub]}") ||
     stop "before proxd-$hub: cannot read the subscription time of ${INSTANCE[$hub]} on $EXPORTER_URL"
+  before_boot=$(subscribed_boot "${INSTANCE[$hub]}") ||
+    stop "before proxd-$hub: cannot read the subscription boot id of ${INSTANCE[$hub]} on $EXPORTER_URL"
   log "roll proxd-$hub: $prev -> $IMAGE"
   if "$ROLL" --approved "$hub" "$IMAGE" &&
-    log "waiting for ${INSTANCE[$hub]} to subscribe again (subscribed at $before before the restart)" &&
-    wait_subscribed "${INSTANCE[$hub]}" "$before"; then
+    log "waiting for ${INSTANCE[$hub]} to subscribe again (subscribed at $before to hub boot ${before_boot:-none} before the restart)" &&
+    wait_subscribed "${INSTANCE[$hub]}" "$before" "$before_boot"; then
     log "proxd-$hub on $IMAGE: /healthz ok, ${INSTANCE[$hub]} subscribed again"
     ROLLED+=("$hub")
     return
@@ -226,7 +250,7 @@ dry_run() {
       continue
     fi
     "$ROLL" --dry-run "$hub" "$IMAGE" | sed 's/^/  /'
-    echo "  then wait: proxd_usage_source_subscribed{instance=\"${INSTANCE[$hub]}\"} 1 and a newer subscribed_timestamp_seconds on $EXPORTER_URL"
+    echo "  then wait: proxd_usage_source_subscribed{instance=\"${INSTANCE[$hub]}\"} 1, a newer subscribed_timestamp_seconds and a new subscribed_boot_info boot id on $EXPORTER_URL"
   done
   echo "rollback (state before the run):"
   # shellcheck disable=SC2086
@@ -303,6 +327,10 @@ main() {
     subscribed "${INSTANCE[$hub]}" || die "${INSTANCE[$hub]} is not subscribed on $EXPORTER_URL before the roll; fix that first"
     subscribed_at "${INSTANCE[$hub]}" >/dev/null ||
       die "$EXPORTER_URL has no proxd_usage_source_subscribed_timestamp_seconds for ${INSTANCE[$hub]}, so a reconnect after the restart cannot be proven; deploy the new prox-usage and proxd-exporter first"
+    # Every source is subscribed here, and a prox-usage that knows the boot id always sends
+    # one while subscribed: no series means that prox-usage or the exporter predates it.
+    [ -n "$(subscribed_boot "${INSTANCE[$hub]}")" ] ||
+      die "$EXPORTER_URL has no proxd_usage_source_subscribed_boot_info for ${INSTANCE[$hub]}, so a reconnect to the new hub process cannot be proven; deploy the prox-usage that sends subscribed_boot_id and the matching proxd-exporter first"
   done
   log "roll-all to $IMAGE; Image= lines before the run, to undo it by hand:"
   # shellcheck disable=SC2086
