@@ -27,7 +27,10 @@ as before. Health series retain their additive identities, including
 gauges. A third, `proxd_usage_source_subscribed_timestamp_seconds{instance}`, is the
 unix time the source last subscribed (NaN while it is not); it appears only when
 prox-usage sends `sources[].subscribed_at_seconds`, so an older prox-usage shows no series.
-`bin/roll-all.sh` needs it to prove a source reconnected after a hub restart. Health and counters share the additive four-second absolute HTTP deadline
+A fourth, `proxd_usage_source_subscribed_boot_info{instance,boot_id} 1`, names the boot id of
+the hub process the source is subscribed to, from `sources[].subscribed_boot_id`; it has no
+series while the source is not subscribed or when prox-usage does not send the field.
+`bin/roll-all.sh` needs both to prove a source reconnected to the new process after a hub restart. Health and counters share the additive four-second absolute HTTP deadline
 and at most one outstanding daemon request. The key stays only in the bearer
 header; it is never put in a URL or logs.
 

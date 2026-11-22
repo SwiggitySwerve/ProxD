@@ -44,7 +44,8 @@ ContainerName=proxd-$hub
 PublishPort=$port:8317
 EOF
   done
-  rm -rf "$T/data" "$T/calls" "$T/systemd-run.args" "$T/bad-hub" "$T/unsubscribed" "$T/unsub-hub" "$T/rebuilt" "$T/stale-ts" "$T/no-ts"
+  rm -rf "$T/data" "$T/calls" "$T/systemd-run.args" "$T/bad-hub" "$T/unsubscribed" "$T/unsub-hub" "$T/rebuilt" "$T/stale-ts" "$T/no-ts" \
+    "$T/stale-boot" "$T/no-boot" "$T/boot-prefix" "$T/boot-gone"
   mkdir -p "$T/data"
   : >"$T/calls"
 }
@@ -112,6 +113,18 @@ case "$url" in
       ts=$((1763700000 + n)).5
       [ "$v" = 1 ] || ts=NaN
       echo "proxd_usage_source_subscribed_timestamp_seconds{instance=\"$h-primary\"} $ts"
+      # Boot id of the hub process the source is on: a new one per restart, unless the hub
+      # is named in $STUB/stale-boot (it reconnected to the old process before the restart);
+      # none while unsubscribed; no series at all with $STUB/no-boot. $STUB/boot-prefix
+      # replaces "boot-" (an escaped label value). A hub named in $STUB/boot-gone loses its
+      # boot id once any hub has restarted, while its gauge and time stay.
+      [ ! -f "$STUB/no-boot" ] && [ "$v" = 1 ] || continue
+      [ -f "$STUB/boot-gone" ] && grep -qx "$h" "$STUB/boot-gone" && grep -q "restart proxd-" "$STUB/calls" && continue
+      b=$(grep -c "restart proxd-$h\." "$STUB/calls")
+      [ -f "$STUB/stale-boot" ] && grep -qx "$h" "$STUB/stale-boot" && b=0
+      prefix=boot-
+      [ ! -f "$STUB/boot-prefix" ] || prefix=$(cat "$STUB/boot-prefix")
+      echo "proxd_usage_source_subscribed_boot_info{instance=\"$h-primary\",boot_id=\"$prefix$h-$b\"} 1"
     done
     cat "$STUB/filler" ;; # the real page is ~300 KB: a reader that stops early breaks the pipe
   */healthz) down "$(hub_of "$url")" && exit 7; exit 0 ;;
@@ -205,17 +218,28 @@ check "subscribed reads the body first and passes" bash -c "$(declare -f subscri
 echo gemini >"$T/unsubscribed"
 check "subscribed is false for a 0 line" bash -c "$(declare -f subscribed); EXPORTER_URL=$EXPORTER_URL; set -euo pipefail; ! subscribed gemini-primary"
 check "subscribed is false for an unknown instance" bash -c "$(declare -f subscribed); EXPORTER_URL=$EXPORTER_URL; set -euo pipefail; ! subscribed codex"
-fns="$(declare -f subscribed_at resubscribed); EXPORTER_URL=$EXPORTER_URL; set -euo pipefail"
-check "subscribed_at reads the subscription time" bash -c "$fns; [ \"\$(subscribed_at codex-primary)\" = 1763700000.5 ]"
-check "subscribed_at is NaN while not subscribed" bash -c "$fns; [ \"\$(subscribed_at gemini-primary)\" = NaN ]"
-check "resubscribed passes a time later than before" bash -c "$fns; resubscribed codex-primary 1763699999.5"
-check "resubscribed refuses an unchanged time" bash -c "$fns; ! resubscribed codex-primary 1763700000.5"
-check "resubscribed refuses an older time" bash -c "$fns; ! resubscribed codex-primary 1763700001"
-check "resubscribed after a NaN before passes any finite time" bash -c "$fns; resubscribed codex-primary NaN"
-check "resubscribed refuses an unsubscribed source after a NaN before" bash -c "$fns; ! resubscribed gemini-primary NaN"
+fns="$(declare -f source_state resubscribed); EXPORTER_URL=$EXPORTER_URL; set -euo pipefail"
+check "resubscribed passes a time later than before" bash -c "$fns; resubscribed codex-primary 1763699999.5 boot-codex-old"
+check "resubscribed refuses an unchanged time" bash -c "$fns; ! resubscribed codex-primary 1763700000.5 boot-codex-old"
+check "resubscribed refuses an older time" bash -c "$fns; ! resubscribed codex-primary 1763700001 boot-codex-old"
+check "resubscribed after a NaN before passes any finite time" bash -c "$fns; resubscribed codex-primary NaN ''"
+check "resubscribed refuses an unsubscribed source after a NaN before" bash -c "$fns; ! resubscribed gemini-primary NaN ''"
+check "source_state reads the gauge, time and boot id from one page" bash -c "$fns; [ \"\$(source_state codex-primary)\" = '1 1763700000.5 boot-codex-0' ]"
+check "source_state has a NaN time and no boot id while not subscribed" bash -c "$fns; [ \"\$(source_state gemini-primary)\" = '0 NaN ' ]"
+check "source_state marks an unknown instance" bash -c "$fns; [ \"\$(source_state codex)\" = '- - ' ]"
+check "resubscribed refuses a later time on the same boot id" bash -c "$fns; ! resubscribed codex-primary 1763699999.5 boot-codex-0"
+check "resubscribed after an empty boot id before passes any boot id" bash -c "$fns; resubscribed codex-primary 1763699999.5 ''"
+printf '%s' 'a\\b\"c-' >"$T/boot-prefix"
+check "source_state keeps the label escapes" bash -c "$fns; [ \"\$(source_state codex-primary)\" = '1 1763700000.5 a\\\\b\\\"c-codex-0' ]"
+check "resubscribed compares escaped boot ids as they are" bash -c "$fns; ! resubscribed codex-primary 1763699999.5 'a\\\\b\\\"c-codex-0'"
+rm "$T/boot-prefix"
+touch "$T/no-boot"
+check "source_state has no boot id without the series" bash -c "$fns; [ \"\$(source_state codex-primary)\" = '1 1763700000.5 ' ]"
+check "resubscribed fails without the boot series" bash -c "$fns; ! resubscribed codex-primary 1763699999.5 ''"
+rm "$T/no-boot"
 touch "$T/no-ts"
-check "subscribed_at fails without the series" bash -c "$fns; ! subscribed_at codex-primary"
-check "resubscribed fails without the series" bash -c "$fns; ! resubscribed codex-primary NaN"
+check "source_state has no time without the series" bash -c "$fns; [ \"\$(source_state codex-primary)\" = '1 - ' ]"
+check "resubscribed fails without the series" bash -c "$fns; ! resubscribed codex-primary NaN ''"
 
 # --- roll-all.sh ---------------------------------------------------------------
 reset_units
@@ -284,6 +308,8 @@ check "roll-all records each hub under its data dir" \
 log=$(ls "$T/data/roll-all/"*.log 2>/dev/null || echo /nonexistent)
 check "roll-all writes a log file" has "$log" "ROLL-ALL COMPLETE"
 check "roll-all passes each hub on a fresh subscription time" has "$log" "gemini-primary subscribed again"
+check "roll-all logs the boot id gemini is compared against" \
+  has "$log" "(subscribed at 1763700000.5 to hub boot boot-gemini-0 before the restart)"
 check "roll-all output shows the log" has "$T/out" "ROLL-ALL COMPLETE"
 check "roll-all prints the rollback commands" has "$log" "$BIN/roll.sh --approved claude $OLD"
 
@@ -326,7 +352,38 @@ check "roll-all rolled back the hub with a stale subscription time" [ "$(img cla
 check "roll-all after a stale subscription time did not touch the hub after it" [ "$(img gemini)" = "$OLD" ]
 check "roll-all after a stale subscription time never restarted gemini" [ "$(restarts)" = "restart proxd-codex restart proxd-claude restart proxd-claude " ]
 check "roll-all reports the stale subscription as a failure" has "$T/out" "proxd-claude FAILED health or subscription"
-check "roll-all logs the time it compared against" has "$T/out" "(subscribed at 1763700000.5 before the restart)"
+check "roll-all logs the time it compared against" has "$T/out" "(subscribed at 1763700000.5 to hub boot boot-claude-0 before the restart)"
+
+# The race: between the read and the restart the source reconnects to the old hub process,
+# so its time moves on, but it keeps the old boot id after the restart.
+reset_units
+timers
+echo claude >"$T/stale-boot"
+SUBSCRIBE_TIMEOUT=1 "$BIN/roll-all.sh" --approved "$NEW" >"$T/out" 2>&1 && bad "roll-all fails on a newer time with the same boot id" ||
+  ok "roll-all fails on a newer time with the same boot id"
+check "roll-all rolled back the hub still on the old boot id" [ "$(img claude)" = "$OLD" ]
+check "roll-all after the same boot id did not touch the hub after it" [ "$(img gemini)" = "$OLD" ]
+check "roll-all after the same boot id never restarted gemini" [ "$(restarts)" = "restart proxd-codex restart proxd-claude restart proxd-claude " ]
+check "roll-all reports the same boot id as a failure" has "$T/out" "proxd-claude FAILED health or subscription"
+
+# The source drops its boot id (but not its time) after the gate: with no boot id read before
+# the restart, a reconnect to the old process could not be told apart, so it stops first.
+reset_units
+timers
+echo claude >"$T/boot-gone"
+SUBSCRIBE_TIMEOUT=1 "$BIN/roll-all.sh" --approved "$NEW" >"$T/out" 2>&1 && bad "roll-all stops on a subscription time without a boot id" ||
+  ok "roll-all stops on a subscription time without a boot id"
+check "roll-all without a boot id to compare never restarted claude" [ "$(restarts)" = "restart proxd-codex " ]
+check "roll-all says which boot id it lacked" has "$T/out" "claude-primary has no subscription time and boot id to compare against"
+
+# An exporter or prox-usage from before the boot id series.
+reset_units
+timers
+touch "$T/no-boot"
+"$BIN/roll-all.sh" --approved "$NEW" >"$T/out" 2>&1 && bad "roll-all refuses without the boot id series" ||
+  ok "roll-all refuses without the boot id series"
+check "roll-all without the boot id series restarted nothing" [ -z "$(restarts)" ]
+check "roll-all says to deploy the prox-usage that sends the boot id" has "$T/out" "deploy the prox-usage that sends subscribed_boot_id and the matching proxd-exporter first"
 
 # An exporter or prox-usage from before the subscription time series.
 reset_units

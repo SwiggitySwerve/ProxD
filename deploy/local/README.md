@@ -184,14 +184,19 @@ refuses an image that is not present locally. No step is done by hand:
   the instance being the quadlet's `CLIPROXY_INSTANCE_ID`, together with a
   `proxd_usage_source_subscribed_timestamp_seconds` for it later than the one it read just
   before the restart (NaN before the restart, meaning not subscribed then, accepts any
-  time). The gauge alone can be stale: on 21 Nov 2026 it read 1 in the same second each hub
+  time), and a `proxd_usage_source_subscribed_boot_info` boot id other than the one it read
+  then (none before the restart accepts any). Each hub process picks a random boot id at
+  start, so a source that reconnects to the old process between that read and the restart
+  gets a later time but keeps the old boot id. It reads the time and the boot id from one
+  page, and stops before the restart if the source shows a time but no boot id. The gauge alone can be stale: on 21 Nov 2026 it read 1 in the same second each hub
   came back. A usage event is no proof either, since quiet hubs go hours without one. It
   reads the whole page and then matches: `curl | grep -q` under `pipefail` fails when grep
   stops early (curl gets EPIPE on the ~300 KB page and exits 23), which once rolled back a
   healthy hub. Before touching anything it checks that all three sources are subscribed, so
   an exporter outage cannot make it roll back a good hub; that each source has the
-  timestamp series, which needs a prox-usage that sends `subscribed_at_seconds` and the
-  matching `proxd-exporter` (deploy both first, or it refuses); and that each hub's
+  timestamp and boot id series, which need a prox-usage that sends `subscribed_at_seconds`
+  and `subscribed_boot_id` and the matching `proxd-exporter` (deploy both first, or it
+  refuses); and that each hub's
   container runs exactly the image its quadlet's `Image=` names, so a rollback restores the
   same image. A tag rebuilt or removed since the hub started is refused.
 - **Stop on failure.** If a hub fails either check, it rolls that hub back to the `Image=`

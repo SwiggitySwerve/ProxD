@@ -205,8 +205,13 @@ def collect_usage_health(m: Metrics):
         # the series is absent (roll-all.sh refuses to roll without it).
         has_at = "subscribed_at_seconds" in source
         at = source_seconds(source.get("subscribed_at_seconds"), "subscription time")
-        samples.append((source["instance"], source["subscribed"], age, has_at, at))
-    for instance, subscribed, age, has_at, at in samples:
+        # Newer still: the boot id of the hub process the source is subscribed to. Absent
+        # from an older prox-usage and null while not subscribed; neither has a series.
+        boot = source.get("subscribed_boot_id")
+        if boot is not None and (not isinstance(boot, str) or not boot):
+            raise ValueError("invalid prox-usage subscription boot id")
+        samples.append((source["instance"], source["subscribed"], age, has_at, at, boot))
+    for instance, subscribed, age, has_at, at, boot in samples:
         m.add("proxd_usage_source_subscribed", "gauge", "1 when the usage source is subscribed.",
               int(subscribed), instance=instance)
         m.add("proxd_usage_source_last_event_age_seconds", "gauge",
@@ -216,6 +221,10 @@ def collect_usage_health(m: Metrics):
             m.add("proxd_usage_source_subscribed_timestamp_seconds", "gauge",
                   "Unix time this usage source last subscribed; NaN while it is not subscribed.",
                   math.nan if at is None else at, instance=instance)
+        if boot is not None:
+            m.add("proxd_usage_source_subscribed_boot_info", "gauge",
+                  "1, labelled with the boot id of the hub process this usage source is subscribed to.",
+                  1, instance=instance, boot_id=boot)
     # A bad job field must never hide source health: the job block is its own
     # all-or-nothing unit. Malformed means no job times and the error flag raised.
     try:
