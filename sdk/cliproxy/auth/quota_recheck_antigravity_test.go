@@ -148,9 +148,14 @@ func TestAntigravityRecheckKeepsCooldownOnUnusableProbe(t *testing.T) {
 		exec := &antigravityProbeExecutor{usageProbeExecutor: &usageProbeExecutor{status: http.StatusOK, body: antigravitySummary("1", "1", "0")}}
 		manager, id := newAntigravityCooledManager(t, exec, "gemini-4-neon-xhigh", "claude-opus-5-5-high")
 		got, _ := manager.GetByID(id)
-		got.ModelStates["claude-opus-5-5-high"].Quota.NextRecoverAt = time.Now().Add(-time.Minute)
+		expired := got.ModelStates["claude-opus-5-5-high"]
+		expired.Quota.NextRecoverAt = time.Now().Add(-time.Minute)
+		expired.NextRetryAfter = time.Now().Add(-time.Minute)
 		if _, err := manager.Update(context.Background(), got); err != nil {
 			t.Fatalf("update: %v", err)
+		}
+		if got, _ := manager.GetByID(id); isModelStateActiveCooldown(got.ModelStates["claude-opus-5-5-high"], time.Now()) {
+			t.Fatal("fixture: the Claude cooldown should already be expired")
 		}
 		manager.reconcileQuotaCooldowns(context.Background())
 		if got, _ := manager.GetByID(id); isModelStateActiveCooldown(got.ModelStates["gemini-4-neon-xhigh"], time.Now()) {
