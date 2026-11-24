@@ -323,7 +323,8 @@ func (m *Manager) clearDisabledCooldownStates(cfg *internalconfig.Config) bool {
 	return len(snapshots) > 0
 }
 
-// RestoreCooldownStates restores unexpired persisted cooldown records into registered auths.
+// RestoreCooldownStates restores unexpired persisted cooldown records, and the
+// persisted renewal state, into registered auths.
 func (m *Manager) RestoreCooldownStates(ctx context.Context) error {
 	if m == nil {
 		return nil
@@ -351,6 +352,11 @@ func (m *Manager) RestoreCooldownStates(ctx context.Context) error {
 
 	m.mu.Lock()
 	for _, record := range records {
+		if m.restoreRenewalStateLocked(record) {
+			if auth := m.auths[strings.TrimSpace(record.AuthID)]; auth != nil {
+				snapshotsByID[auth.ID] = auth.Clone()
+			}
+		}
 		if m.restoreQuotaObservationLocked(record) {
 			if auth := m.auths[strings.TrimSpace(record.AuthID)]; auth != nil {
 				snapshotsByID[auth.ID] = auth.Clone()
@@ -1153,6 +1159,7 @@ func (m *Manager) persistCooldownStatesToLocked(ctx context.Context, store Coold
 		return false
 	}
 	m.noteQuotaObservationsSaved()
+	m.noteRenewalStatesSaved(records)
 	return ctx.Err() == nil
 }
 
@@ -1162,7 +1169,7 @@ func (m *Manager) cooldownStateRecordsSnapshot() []CooldownStateRecord {
 
 	m.mu.RLock()
 	for _, auth := range m.auths {
-		records = append(records, attachQuotaObservationsLocked(auth, m.cooldownStateRecordsForAuthLocked(auth, now))...)
+		records = append(records, attachRenewalStateLocked(auth, attachQuotaObservationsLocked(auth, m.cooldownStateRecordsForAuthLocked(auth, now)))...)
 	}
 	m.mu.RUnlock()
 
@@ -1445,6 +1452,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	now := time.Now()
 	// A 401 condemns the access token, except one a -and-cooldown rule matched: that only cools the credential.
 	rejectsToken := !result.Success && (result.Error == nil || result.Error.Code != ErrorCodeForceCooldown) && !shouldSkipCredentialCooldown(result.Error) && (statusCodeFromResult(result.Error) == http.StatusUnauthorized || isUnauthorizedError(result.Error))
+	if rejectsToken {
+		// Deferred first so it runs after the gate and m.mu are released.
+		defer m.persistRenewalStateIfChanged(result.AuthID)
+	}
 
 	releaseMutation := m.lockAuthMutation(result.AuthID)
 	defer releaseMutation()

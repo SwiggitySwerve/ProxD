@@ -1262,6 +1262,8 @@ func (m *Manager) markRejectedAccessToken(id, failedAccessToken string) {
 	if m == nil || id == "" || failedAccessToken == "" {
 		return
 	}
+	// Deferred first so it runs after the gate and m.mu are released.
+	defer m.persistRenewalStateIfChanged(id)
 	releaseMutation := m.lockAuthMutation(id)
 	defer releaseMutation()
 	m.mu.Lock()
@@ -1292,6 +1294,8 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	if id == "" {
 		return nil, errors.New("auth id is empty")
 	}
+	// Deferred first so it runs after the refresh lock is released.
+	defer m.persistRenewalStateIfChanged(id)
 	if failedAccessToken != "" {
 		m.markRejectedAccessToken(id, failedAccessToken)
 	}

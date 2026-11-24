@@ -268,6 +268,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
 	}
+	m.persistRenewalStateIfChanged(auth.ID)
 	return auth.Clone(), nil
 }
 
@@ -378,6 +379,7 @@ func (m *Manager) finishAuthUpdate(ctx context.Context, committed *Auth, persist
 	if persistCooldown {
 		m.persistCooldownStates(context.Background())
 	}
+	m.persistRenewalStateIfChanged(committed.ID)
 }
 
 // updateInternalLocked assumes the caller already holds the per-auth

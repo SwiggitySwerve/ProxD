@@ -74,6 +74,10 @@ type CooldownStateRecord struct {
 	// IndependentState beneath a credential_quota wrap. Read only, like
 	// IndependentState; never written.
 	IndependentNonQuotaCooldownUntil time.Time `json:"independent_non_quota_cooldown_until,omitempty"`
+	// Renewal persists the auth's renewal decision on its auth-level record
+	// (empty Model). Records carrying only Renewal have a zero NextRetryAfter
+	// and never restore a cooldown.
+	Renewal *RenewalStateRecord `json:"renewal,omitempty"`
 }
 
 // CooldownStateStore persists runtime cooldown state independently from auth tokens.

@@ -282,6 +282,9 @@ type Manager struct {
 	quotaObservationFlush quotaObservationFlushState
 	// quotaObservationNow overrides the throttle clock in tests.
 	quotaObservationNow func() time.Time
+	// renewalStateSaved holds the renewal state of the last successful cooldown
+	// state save, keyed by auth ID. Guarded by configCooldownMu.
+	renewalStateSaved map[string]*RenewalStateRecord
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
