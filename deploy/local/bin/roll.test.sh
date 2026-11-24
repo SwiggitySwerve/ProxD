@@ -423,6 +423,9 @@ reset_units
 sed -i 's/^Environment=CLIPROXY_INSTANCE_ID=gemini-primary/Environment=FOO=bar\\\nEnvironment=CLIPROXY_INSTANCE_ID=gemini-primary/' "$T/units/proxd-gemini.container"
 check "roll-all stops on an instance id line Quadlet joins to the line before" refuses
 reset_units
+sed -i 's/^Environment=CLIPROXY_INSTANCE_ID=gemini-primary/Environment=FOO=bar\\\n# a comment\nEnvironment=CLIPROXY_INSTANCE_ID=gemini-primary/' "$T/units/proxd-gemini.container"
+check "roll-all stops on a continued line even with a comment before the instance id" refuses
+reset_units
 chmod 000 "$T/units/proxd-gemini.container"
 check "roll-all stops on a quadlet it cannot read" refuses
 chmod 644 "$T/units/proxd-gemini.container"

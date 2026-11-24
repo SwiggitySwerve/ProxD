@@ -156,11 +156,12 @@ unit_image() { sed -n 's/^Image=//p' "$(unit_path "$1")" | head -n1; }
 # being guessed at, so discovery and the subscription check can never disagree.
 quadlet_instance() { # quadlet_instance <unit-file>; empty when the quadlet declares none
   local plain any
-  # A line Quadlet would join to the one before it (that one ends in a backslash) is not a
-  # line of its own, so it does not count as the plain form.
-  plain=$(awk '/^Environment=CLIPROXY_INSTANCE_ID=[A-Za-z0-9][A-Za-z0-9._-]*$/ && prev !~ /\\$/ {
-      sub(/^Environment=CLIPROXY_INSTANCE_ID=/, ""); print; exit
-    } { prev = $0 }' "$1")
+  # Quadlet joins a line ending in a backslash to the lines after it (skipping comments), so
+  # no line of a hub quadlet can be read on its own then. Ours never continue a line.
+  if grep -q 'CLIPROXY_INSTANCE_ID' "$1" && grep -q '\\$' "$1"; then
+    die "$1 continues a line with a backslash; write each setting on one line"
+  fi
+  plain=$(sed -n 's/^Environment=CLIPROXY_INSTANCE_ID=\([A-Za-z0-9][A-Za-z0-9._-]*\)$/\1/p' "$1" | head -n1)
   any=$(grep -c 'CLIPROXY_INSTANCE_ID' "$1" || true)
   if [ "$any" != 0 ] && { [ -z "$plain" ] || [ "$any" != 1 ]; }; then
     die "$1 must declare its hub as one line Environment=CLIPROXY_INSTANCE_ID=<id>"
