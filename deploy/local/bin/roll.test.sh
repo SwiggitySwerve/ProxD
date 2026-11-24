@@ -46,7 +46,7 @@ EOF
   done
   rm -rf "$T/data" "$T/calls" "$T/systemd-run.args" "$T/bad-hub" "$T/unsubscribed" "$T/unsub-hub" "$T/rebuilt" "$T/stale-ts" "$T/no-ts" \
     "$T/stale-boot" "$T/no-boot" "$T/boot-prefix" "$T/boot-gone" "$T"/masked-* \
-    "$T/units/proxd-meta.container" "$T/units/proxd-catalog.container" "$T/units/proxd-staging.container" "$T/state-unknown"
+    "$T/units/proxd-meta.container" "$T/units/proxd-catalog.container" "$T/units/proxd-staging.container" "$T/state-unknown" "$T/masked-proxd-staging"
   mkdir -p "$T/data"
   : >"$T/calls"
 }
@@ -410,9 +410,12 @@ rm -f "$T/masked-proxd-gemini"
 touch "$T/state-unknown"
 check "roll-all stops when it cannot read a unit's state" refuses
 rm -f "$T/state-unknown"
+check "roll-all reads the plain instance id for the subscription check" [ "$(unit_instance gemini)" = "gemini-primary" ]
 sed -i 's/^Environment=CLIPROXY_INSTANCE_ID=gemini-primary/Environment="FOO=1" "CLIPROXY_INSTANCE_ID=gemini-primary"/' "$T/units/proxd-gemini.container"
-check "roll-all reads a quoted instance id among other assignments" [ "$(discovered)" = "codex claude gemini" ]
-check "roll-all reads the same quoted instance id for the subscription check" [ "$(INSTANCE=; unit_instance gemini)" = "gemini-primary" ]
+check "roll-all stops on an instance id in any other form" refuses
+reset_units
+printf 'Environment="FOO=look for CLIPROXY_INSTANCE_ID=wrong"\n' >>"$T/units/proxd-gemini.container"
+check "roll-all stops on a second mention of the instance id" refuses
 reset_units
 chmod 000 "$T/units/proxd-gemini.container"
 check "roll-all stops on a quadlet it cannot read" refuses
@@ -425,6 +428,9 @@ check "roll-all stops on a discovered hub roll.sh cannot roll, before any restar
 rm -f "$T/units/proxd-meta.container"
 cp "$T/units/proxd-codex.container" "$T/units/proxd-staging.container"
 check "roll-all refuses a staging quadlet as a live hub" refuses
+echo masked >"$T/masked-proxd-staging"
+check "roll-all refuses a staging quadlet even when it is masked" refuses
+rm -f "$T/masked-proxd-staging"
 
 reset_units
 timers

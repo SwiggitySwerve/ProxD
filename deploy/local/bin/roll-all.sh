@@ -150,23 +150,33 @@ wait_subscribed() { # wait_subscribed <instance> <before> <before_boot>
 
 unit_path() { echo "$UNIT_DIR/proxd-$1.container"; }
 unit_image() { sed -n 's/^Image=//p' "$(unit_path "$1")" | head -n1; }
-# The hub's instance id from its Environment= lines, quoted or not, alone or among other
-# assignments (Quadlet accepts all of these). Empty when the quadlet declares none.
-quadlet_instance() { # quadlet_instance <unit-file>
-  sed -n 's/^Environment=//p' "$1" | grep -oE '(^|[" ])CLIPROXY_INSTANCE_ID=[^" ]+' |
-    head -n1 | sed 's/^[" ]//; s/^CLIPROXY_INSTANCE_ID=//' || true
+# The hub's instance id. Our quadlets declare it on its own line as
+# Environment=CLIPROXY_INSTANCE_ID=<id>, the only form read here (as before discovery).
+# Any other mention of it (quoted, among other assignments) stops the run rather than
+# being guessed at, so discovery and the subscription check can never disagree.
+quadlet_instance() { # quadlet_instance <unit-file>; empty when the quadlet declares none
+  local plain any
+  plain=$(sed -n 's/^Environment=CLIPROXY_INSTANCE_ID=\([A-Za-z0-9._-]\{1,\}\)$/\1/p' "$1" | head -n1)
+  any=$(grep -c 'CLIPROXY_INSTANCE_ID' "$1" || true)
+  if [ "$any" != 0 ] && { [ -z "$plain" ] || [ "$any" != 1 ]; }; then
+    die "$1 must declare its hub as one line Environment=CLIPROXY_INSTANCE_ID=<id>"
+  fi
+  echo "$plain"
 }
 unit_instance() { quadlet_instance "$(unit_path "$1")"; }
 
 declare -A PREV INSTANCE
 discover_hubs() {
-  local unit hub state found=" " ordered=""
+  local unit hub state instance found=" " ordered=""
   for unit in "$UNIT_DIR"/proxd-*.container; do
     [ -e "$unit" ] || continue
     [ -r "$unit" ] || die "cannot read $unit"
-    [ -n "$(quadlet_instance "$unit")" ] || continue
+    # quadlet_instance runs in a subshell here: its die only ends that, so stop on its status.
+    instance=$(quadlet_instance "$unit") || exit 1
+    [ -n "$instance" ] || continue
     hub=${unit##*/proxd-}
     hub=${hub%.container}
+    [ "$hub" != staging ] || die "$unit declares a hub instance, but staging is not a live hub"
     state=$(systemctl --user is-enabled "proxd-$hub" 2>/dev/null || true)
     case $state in
       masked | masked-runtime)
@@ -175,7 +185,6 @@ discover_hubs() {
         ;;
       "") die "cannot read the unit state of proxd-$hub (systemctl --user is-enabled)" ;;
     esac
-    [ "$hub" != staging ] || die "$unit declares a hub instance, but staging is not a live hub"
     found="$found$hub "
   done
   for hub in $ROLL_ORDER; do
