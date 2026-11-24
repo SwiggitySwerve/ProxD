@@ -263,11 +263,16 @@ func (s *FileCooldownStateStore) saveScopedGroups(ctx context.Context, groups ma
 			own(path, record.AuthID)
 		}
 	}
+	// One unreadable file is left as it is and reported after the others are saved.
+	var errUnreadable error
 	for path, authIDs := range owned {
 		// An unreadable file is not empty: it may hold another credential's records.
 		existing, errRead := readCooldownStateFile(ctx, path)
 		if errRead != nil {
-			return errRead
+			if errUnreadable == nil {
+				errUnreadable = errRead
+			}
+			continue
 		}
 		merged := groups[path]
 		for _, record := range existing {
@@ -285,7 +290,7 @@ func (s *FileCooldownStateStore) saveScopedGroups(ctx context.Context, groups ma
 			return errSave
 		}
 	}
-	return nil
+	return errUnreadable
 }
 
 // LoadAuth reads the state file of the credential owner describes.

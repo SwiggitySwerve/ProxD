@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -712,5 +713,41 @@ func TestRenewalPersist_UnreadableSharedStateFileIsNotOverwritten(t *testing.T) 
 	}
 	if string(data) != string(corrupt) {
 		t.Fatalf("shared state file was rewritten: %q", data)
+	}
+}
+
+// One unreadable state file must not keep the other credentials in the same
+// save from being written.
+func TestRenewalPersist_UnreadableStateFileDoesNotBlockOthers(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store := NewFileCooldownStateStoreWithAuthDir(dir, dir)
+	corrupt := filepath.Join(dir, "broken.cds")
+	if err := os.WriteFile(corrupt, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	broken := CooldownStateRecord{AuthID: "broken.json", AuthFile: filepath.Join(dir, "broken.json")}
+	healthy := make([]CooldownStateRecord, 0, 8)
+	for i := 0; i < 8; i++ {
+		name := fmt.Sprintf("healthy-%d.json", i)
+		healthy = append(healthy, CooldownStateRecord{
+			AuthID:   name,
+			AuthFile: filepath.Join(dir, name),
+			Status:   "renewal",
+			Renewal:  &RenewalStateRecord{RequiresSignIn: true},
+		})
+	}
+	owners := append([]CooldownStateRecord{broken}, healthy...)
+	if err := store.SaveScoped(ctx, healthy, owners); err == nil {
+		t.Fatal("save with an unreadable state file returned nil")
+	}
+	for _, record := range healthy {
+		loaded, err := store.LoadAuth(ctx, record)
+		if err != nil || len(loaded) != 1 || loaded[0].Renewal == nil || !loaded[0].Renewal.RequiresSignIn {
+			t.Fatalf("%s was not saved: %+v %v", record.AuthID, loaded, err)
+		}
+	}
+	if data, err := os.ReadFile(corrupt); err != nil || string(data) != "{not json" {
+		t.Fatalf("unreadable state file changed: %q %v", data, err)
 	}
 }
