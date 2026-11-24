@@ -690,3 +690,27 @@ func TestRenewalPersist_CollidingCredentialsShareStateFile(t *testing.T) {
 		t.Fatalf("removing one credential dropped the other's record: %+v", record)
 	}
 }
+
+// A shared state file that cannot be read must not be treated as empty: the
+// save fails and leaves the file, so another credential's record survives.
+func TestRenewalPersist_UnreadableSharedStateFileIsNotOverwritten(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store := NewFileCooldownStateStoreWithAuthDir(dir, dir)
+	shared := filepath.Join(dir, "a_b.cds")
+	corrupt := []byte("{not json")
+	if err := os.WriteFile(shared, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	owner := CooldownStateRecord{AuthID: "a b.json", AuthFile: filepath.Join(dir, "a b.json")}
+	if err := store.SaveScoped(ctx, nil, []CooldownStateRecord{owner}); err == nil {
+		t.Fatal("save over an unreadable shared state file returned nil")
+	}
+	data, err := os.ReadFile(shared)
+	if err != nil {
+		t.Fatalf("shared state file was removed: %v", err)
+	}
+	if string(data) != string(corrupt) {
+		t.Fatalf("shared state file was rewritten: %q", data)
+	}
+}

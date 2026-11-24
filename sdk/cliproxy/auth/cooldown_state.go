@@ -264,7 +264,11 @@ func (s *FileCooldownStateStore) saveScopedGroups(ctx context.Context, groups ma
 		}
 	}
 	for path, authIDs := range owned {
-		existing, _ := readCooldownStateFile(ctx, path)
+		// An unreadable file is not empty: it may hold another credential's records.
+		existing, errRead := readCooldownStateFile(ctx, path)
+		if errRead != nil {
+			return errRead
+		}
 		merged := groups[path]
 		for _, record := range existing {
 			if _, replaced := authIDs[record.AuthID]; !replaced {
