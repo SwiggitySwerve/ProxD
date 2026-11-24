@@ -159,9 +159,7 @@ func assertSameRenewalState(t *testing.T, before, after *Auth) {
 	if after.RequiresSignIn != before.RequiresSignIn {
 		t.Fatalf("RequiresSignIn after restart = %v, want %v", after.RequiresSignIn, before.RequiresSignIn)
 	}
-	if !cooldownErrorEqual(after.RefreshError, before.RefreshError) {
-		t.Fatalf("RefreshError after restart = %+v, want %+v", after.RefreshError, before.RefreshError)
-	}
+	assertRestoredRefreshError(t, before.RefreshError, after.RefreshError)
 	if !after.RenewalEventAt.Equal(before.RenewalEventAt) {
 		t.Fatalf("RenewalEventAt after restart = %v, want %v", after.RenewalEventAt, before.RenewalEventAt)
 	}
@@ -171,6 +169,22 @@ func assertSameRenewalState(t *testing.T, before, after *Auth) {
 		t.Fatalf("rejection markers after restart = %q/%q/%q/%q/%q, want %q/%q/%q/%q/%q",
 			after.RejectedAccessToken, after.RejectedSIWCAccessToken, after.RejectedRefreshToken, after.RejectedSIWCRefreshToken, after.RenewalWarnedRefreshToken,
 			before.RejectedAccessToken, before.RejectedSIWCAccessToken, before.RejectedRefreshToken, before.RejectedSIWCRefreshToken, before.RenewalWarnedRefreshToken)
+	}
+}
+
+// assertRestoredRefreshError checks a restored RefreshError: same code, status
+// and retryability, with the local message instead of upstream diagnostics.
+func assertRestoredRefreshError(t *testing.T, before, after *Error) {
+	t.Helper()
+	if before == nil || after == nil {
+		if before != after {
+			t.Fatalf("RefreshError after restart = %+v, want %+v", after, before)
+		}
+		return
+	}
+	code := persistedRenewalErrorCode(before.Code)
+	if after.Code != code || after.HTTPStatus != before.HTTPStatus || after.Retryable != before.Retryable || after.Message != restoredRenewalErrorMessage(code) {
+		t.Fatalf("RefreshError after restart = %+v, want code %q status %d retryable %v with the local message", after, code, before.HTTPStatus, before.Retryable)
 	}
 }
 
@@ -387,8 +401,8 @@ func TestRenewalRestart_PartialCodexRefreshKeepsSignIn(t *testing.T) {
 	if !transient.RequiresSignIn || transient.RejectedRefreshToken != "outer-rt-secret" {
 		t.Fatalf("transient failure after restart: RequiresSignIn=%v Rejected=%q", transient.RequiresSignIn, transient.RejectedRefreshToken)
 	}
-	if !cooldownErrorEqual(transient.RefreshError, before.RefreshError) {
-		t.Fatalf("transient failure replaced the terminal RefreshError: %+v, want %+v", transient.RefreshError, before.RefreshError)
+	if !cooldownErrorEqual(transient.RefreshError, after.RefreshError) {
+		t.Fatalf("transient failure replaced the terminal RefreshError: %+v, want %+v", transient.RefreshError, after.RefreshError)
 	}
 }
 

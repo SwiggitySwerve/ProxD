@@ -99,10 +99,18 @@ func TestListAuthFiles_TerminalRenewalSurvivesRestart(t *testing.T) {
 			}
 
 			entryAfter := list(start())
-			for _, key := range []string{"requires_sign_in", "status", "status_message", "unavailable", "renewal_state", "recovery_stage", "refresh_error", "next_action", "renewal_event"} {
+			for _, key := range []string{"requires_sign_in", "status", "status_message", "unavailable", "renewal_state", "recovery_stage", "next_action", "renewal_event"} {
 				if !reflect.DeepEqual(entryAfter[key], entryBefore[key]) {
 					t.Fatalf("%s after restart = %#v, want %#v", key, entryAfter[key], entryBefore[key])
 				}
+			}
+			// The refresh error keeps its code and status; its upstream message is
+			// not persisted, so a local message replaces it.
+			errBefore, _ := entryBefore["refresh_error"].(map[string]any)
+			errAfter, _ := entryAfter["refresh_error"].(map[string]any)
+			if errBefore == nil || errAfter == nil || errAfter["code"] != errBefore["code"] || errAfter["http_status"] != errBefore["http_status"] ||
+				errAfter["message"] != "token refresh rejected (refresh_token_expired); sign in again" {
+				t.Fatalf("refresh_error after restart = %#v, before = %#v", errAfter, errBefore)
 			}
 		})
 	}

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -13,6 +14,10 @@ import (
 // grant that upstream already rejected. Token values are never stored: each
 // rejected-token marker is kept as a SHA-256 fingerprint and restored only
 // while the credential still carries the token it fingerprints.
+//
+// Only a sign-in decision is persisted with its RefreshError, and that error
+// keeps only an allowlisted code, the HTTP status and retryability: upstream
+// diagnostics never reach disk, and the message is rebuilt on restore.
 type RenewalStateRecord struct {
 	RequiresSignIn bool      `json:"requires_sign_in,omitempty"`
 	RefreshError   *Error    `json:"refresh_error,omitempty"`
@@ -70,32 +75,52 @@ func authHasRenewalState(auth *Auth) bool {
 		auth.RenewalWarnedRefreshToken != "")
 }
 
+// persistedRenewalErrorCode returns code when it is a known safe OAuth or
+// renewal code, and "refresh_failed" otherwise.
+func persistedRenewalErrorCode(code string) string {
+	code = strings.ToLower(strings.TrimSpace(code))
+	if isKnownSafeOAuthErrorCode(code) {
+		return code
+	}
+	return "refresh_failed"
+}
+
+// restoredRenewalErrorMessage is the local text a restored RefreshError carries.
+func restoredRenewalErrorMessage(code string) string {
+	return "token refresh rejected (" + code + "); sign in again"
+}
+
 // renewalStateRecordOf returns the persisted form of the auth's renewal state,
-// or nil when there is nothing to remember.
+// or nil when there is nothing to remember. A transient refresh failure is not
+// persisted: its retry schedule is not either, so it would outlive its meaning.
 func renewalStateRecordOf(auth *Auth) *RenewalStateRecord {
-	if !authHasRenewalState(auth) {
+	if auth == nil {
 		return nil
 	}
-	var refreshErr *Error
-	if auth.RefreshError != nil {
-		refreshErr = &Error{
-			Code:       auth.RefreshError.Code,
-			Message:    sanitizeRenewalMessage(auth.RefreshError.Message),
-			Retryable:  auth.RefreshError.Retryable,
-			HTTPStatus: auth.RefreshError.HTTPStatus,
+	record := &RenewalStateRecord{
+		RejectedAccessTokenSHA256:      renewalFingerprint(auth.RejectedAccessToken),
+		RejectedSIWCAccessTokenSHA256:  renewalFingerprint(auth.RejectedSIWCAccessToken),
+		RejectedRefreshTokenSHA256:     renewalFingerprint(auth.RejectedRefreshToken),
+		RejectedSIWCRefreshTokenSHA256: renewalFingerprint(auth.RejectedSIWCRefreshToken),
+	}
+	if auth.RequiresSignIn {
+		record.RequiresSignIn = true
+		record.RenewalEventAt = auth.RenewalEventAt
+		record.RenewalWarnedRefreshTokenSHA256 = renewalFingerprint(auth.RenewalWarnedRefreshToken)
+		if auth.RefreshError != nil {
+			record.RefreshError = &Error{
+				Code:       persistedRenewalErrorCode(auth.RefreshError.Code),
+				Retryable:  auth.RefreshError.Retryable,
+				HTTPStatus: auth.RefreshError.HTTPStatus,
+			}
 		}
 	}
-	return &RenewalStateRecord{
-		RequiresSignIn:                  auth.RequiresSignIn,
-		RefreshError:                    refreshErr,
-		RenewalEventAt:                  auth.RenewalEventAt,
-		GrantSHA256:                     renewalGrantSHA256(auth),
-		RejectedAccessTokenSHA256:       renewalFingerprint(auth.RejectedAccessToken),
-		RejectedSIWCAccessTokenSHA256:   renewalFingerprint(auth.RejectedSIWCAccessToken),
-		RejectedRefreshTokenSHA256:      renewalFingerprint(auth.RejectedRefreshToken),
-		RejectedSIWCRefreshTokenSHA256:  renewalFingerprint(auth.RejectedSIWCRefreshToken),
-		RenewalWarnedRefreshTokenSHA256: renewalFingerprint(auth.RenewalWarnedRefreshToken),
+	if !record.RequiresSignIn && record.RejectedAccessTokenSHA256 == "" && record.RejectedSIWCAccessTokenSHA256 == "" &&
+		record.RejectedRefreshTokenSHA256 == "" && record.RejectedSIWCRefreshTokenSHA256 == "" {
+		return nil
 	}
+	record.GrantSHA256 = renewalGrantSHA256(auth)
+	return record
 }
 
 func renewalStateRecordEqual(a, b *RenewalStateRecord) bool {
@@ -149,19 +174,14 @@ func matchRenewalToken(fingerprint string, candidates ...string) string {
 	return ""
 }
 
-// restoreRenewalStateLocked restores a persisted renewal decision into an auth
-// that holds none. A marker is restored only when the credential still carries
-// the token it fingerprints. The sign-in decision itself is restored when the
+// restoreRenewalState restores a persisted renewal decision into an auth that
+// holds none. A marker is restored only when the credential still carries the
+// token it fingerprints. The sign-in decision itself is restored when the
 // credential is unchanged, or, like a credential replacement in memory, when a
 // rejected refresh token is still present. Status and availability are not
 // touched: the access-token eligibility rules decide whether it can serve.
-func (m *Manager) restoreRenewalStateLocked(record CooldownStateRecord) bool {
-	saved := record.Renewal
-	if saved == nil || strings.TrimSpace(record.Model) != "" {
-		return false
-	}
-	auth := m.auths[strings.TrimSpace(record.AuthID)]
-	if auth == nil || authHasRenewalState(auth) {
+func restoreRenewalState(auth *Auth, saved *RenewalStateRecord) bool {
+	if auth == nil || saved == nil || authHasRenewalState(auth) {
 		return false
 	}
 	outerRT := authRefreshToken(auth)
@@ -176,7 +196,15 @@ func (m *Manager) restoreRenewalStateLocked(record CooldownStateRecord) bool {
 	keepDecision := grantUnchanged || (saved.RequiresSignIn && (rejectedRT != "" || rejectedSIWCRT != ""))
 	if keepDecision {
 		auth.RequiresSignIn = saved.RequiresSignIn
-		auth.RefreshError = cloneError(saved.RefreshError)
+		if saved.RequiresSignIn && saved.RefreshError != nil {
+			code := persistedRenewalErrorCode(saved.RefreshError.Code)
+			auth.RefreshError = &Error{
+				Code:       code,
+				Message:    restoredRenewalErrorMessage(code),
+				Retryable:  saved.RefreshError.Retryable,
+				HTTPStatus: saved.RefreshError.HTTPStatus,
+			}
+		}
 		auth.RenewalEventAt = saved.RenewalEventAt
 		auth.RejectedRefreshToken = rejectedRT
 		auth.RejectedSIWCRefreshToken = rejectedSIWCRT
@@ -191,8 +219,93 @@ func (m *Manager) restoreRenewalStateLocked(record CooldownStateRecord) bool {
 	return true
 }
 
-// noteRenewalStatesSaved records the renewal state written by a successful
-// save. Callers hold configCooldownMu.
+// renewalRestoreFence identifies the runtime auth a renewal restore may write:
+// the same published object at the same generation as when the load began.
+type renewalRestoreFence struct {
+	auth       *Auth
+	generation uint64
+}
+
+// renewalRestoreFencesLocked captures the fence for every registered auth.
+// Callers hold m.mu.
+func (m *Manager) renewalRestoreFencesLocked() map[string]renewalRestoreFence {
+	fences := make(map[string]renewalRestoreFence, len(m.auths))
+	for id, auth := range m.auths {
+		if auth != nil {
+			fences[id] = renewalRestoreFence{auth: auth, generation: auth.Generation}
+		}
+	}
+	return fences
+}
+
+// restoreRenewalStateLocked restores a loaded renewal record. An auth that
+// changed while the records were loading is skipped: the loaded copy may be
+// older than its current state. A record whose auth is not registered yet is
+// kept so a later registration can use it and later saves keep it on disk.
+// Callers hold m.mu.
+func (m *Manager) restoreRenewalStateLocked(record CooldownStateRecord, fences map[string]renewalRestoreFence) bool {
+	authID := strings.TrimSpace(record.AuthID)
+	if record.Renewal == nil || authID == "" || strings.TrimSpace(record.Model) != "" {
+		return false
+	}
+	auth := m.auths[authID]
+	if auth == nil {
+		if _, known := fences[authID]; !known {
+			if m.pendingRenewalStates == nil {
+				m.pendingRenewalStates = make(map[string]pendingRenewalState)
+			}
+			m.pendingRenewalStates[authID] = pendingRenewalState{provider: strings.TrimSpace(record.Provider), renewal: record.Renewal}
+		}
+		return false
+	}
+	if fence, ok := fences[authID]; !ok || fence.auth != auth || fence.generation != auth.Generation {
+		return false
+	}
+	return restoreRenewalState(auth, record.Renewal)
+}
+
+// pendingRenewalState is a loaded renewal record whose auth is not registered.
+type pendingRenewalState struct {
+	provider string
+	renewal  *RenewalStateRecord
+}
+
+// pendingRenewalRecordsLocked returns renewal-only records for pending states
+// so saves keep them. Callers hold m.mu.
+func (m *Manager) pendingRenewalRecordsLocked() []CooldownStateRecord {
+	records := make([]CooldownStateRecord, 0, len(m.pendingRenewalStates))
+	for authID, pending := range m.pendingRenewalStates {
+		if m.auths[authID] != nil {
+			continue
+		}
+		records = append(records, CooldownStateRecord{Provider: pending.provider, AuthID: authID, Status: "renewal", Renewal: pending.renewal})
+	}
+	return records
+}
+
+// takePendingRenewalStateLocked restores and forgets the pending renewal state
+// of a newly registered auth. Callers hold m.mu.
+func (m *Manager) takePendingRenewalStateLocked(auth *Auth) {
+	if auth == nil {
+		return
+	}
+	pending, ok := m.pendingRenewalStates[auth.ID]
+	if !ok {
+		return
+	}
+	delete(m.pendingRenewalStates, auth.ID)
+	restoreRenewalState(auth, pending.renewal)
+}
+
+// renewalSavedState holds the renewal state of the last successful cooldown
+// state save, keyed by auth ID. Its own lock lets a caller see that nothing
+// changed without waiting behind a save in progress.
+type renewalSavedState struct {
+	mu      sync.Mutex
+	records map[string]*RenewalStateRecord
+}
+
+// noteRenewalStatesSaved records the renewal state written by a successful save.
 func (m *Manager) noteRenewalStatesSaved(records []CooldownStateRecord) {
 	saved := make(map[string]*RenewalStateRecord)
 	for _, record := range records {
@@ -200,7 +313,9 @@ func (m *Manager) noteRenewalStatesSaved(records []CooldownStateRecord) {
 			saved[record.AuthID] = record.Renewal
 		}
 	}
-	m.renewalStateSaved = saved
+	m.renewalSaved.mu.Lock()
+	m.renewalSaved.records = saved
+	m.renewalSaved.mu.Unlock()
 }
 
 // persistRenewalStateIfChanged saves runtime state when the auth's renewal
@@ -217,10 +332,11 @@ func (m *Manager) persistRenewalStateIfChanged(authID string) {
 	if store == nil {
 		return
 	}
-	m.configCooldownMu.Lock()
-	defer m.configCooldownMu.Unlock()
-	if renewalStateRecordEqual(m.renewalStateSaved[authID], current) {
+	m.renewalSaved.mu.Lock()
+	unchanged := renewalStateRecordEqual(m.renewalSaved.records[authID], current)
+	m.renewalSaved.mu.Unlock()
+	if unchanged {
 		return
 	}
-	m.persistCooldownStatesLocked(context.Background())
+	m.persistCooldownStates(context.Background())
 }

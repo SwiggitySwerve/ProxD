@@ -245,6 +245,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 			updateAggregatedAvailability(auth, now)
 		}
 	}
+	m.takePendingRenewalStateLocked(auth)
 	auth.ClearFileSnapshot()
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
@@ -814,9 +815,15 @@ func (m *Manager) RemoveIf(ctx context.Context, id string, predicate func(*Auth)
 	m.mu.Lock()
 	existing := m.auths[id]
 	if existing == nil {
+		_, hadPending := m.pendingRenewalStates[id]
+		delete(m.pendingRenewalStates, id)
 		m.mu.Unlock()
+		if hadPending {
+			m.persistCooldownStates(context.Background())
+		}
 		return false
 	}
+	delete(m.pendingRenewalStates, id)
 	provider := strings.TrimSpace(existing.Provider)
 	delete(m.auths, id)
 	m.notifyAuthChangeLocked(id)

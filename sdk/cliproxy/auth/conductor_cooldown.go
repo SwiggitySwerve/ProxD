@@ -334,6 +334,7 @@ func (m *Manager) RestoreCooldownStates(ctx context.Context) error {
 	}
 	m.mu.RLock()
 	store := m.cooldownStore
+	renewalFences := m.renewalRestoreFencesLocked()
 	m.mu.RUnlock()
 	if store == nil {
 		return nil
@@ -351,12 +352,16 @@ func (m *Manager) RestoreCooldownStates(ctx context.Context) error {
 	snapshotsByID := make(map[string]*Auth)
 
 	m.mu.Lock()
-	for _, record := range records {
-		if m.restoreRenewalStateLocked(record) {
-			if auth := m.auths[strings.TrimSpace(record.AuthID)]; auth != nil {
-				snapshotsByID[auth.ID] = auth.Clone()
+	if m.cooldownStore == store {
+		for _, record := range records {
+			if m.restoreRenewalStateLocked(record, renewalFences) {
+				if auth := m.auths[strings.TrimSpace(record.AuthID)]; auth != nil {
+					snapshotsByID[auth.ID] = auth.Clone()
+				}
 			}
 		}
+	}
+	for _, record := range records {
 		if m.restoreQuotaObservationLocked(record) {
 			if auth := m.auths[strings.TrimSpace(record.AuthID)]; auth != nil {
 				snapshotsByID[auth.ID] = auth.Clone()
@@ -1171,6 +1176,7 @@ func (m *Manager) cooldownStateRecordsSnapshot() []CooldownStateRecord {
 	for _, auth := range m.auths {
 		records = append(records, attachRenewalStateLocked(auth, attachQuotaObservationsLocked(auth, m.cooldownStateRecordsForAuthLocked(auth, now)))...)
 	}
+	records = append(records, m.pendingRenewalRecordsLocked()...)
 	m.mu.RUnlock()
 
 	sort.Slice(records, func(i, j int) bool {
