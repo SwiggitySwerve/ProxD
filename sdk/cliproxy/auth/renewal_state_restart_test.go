@@ -40,6 +40,9 @@ func (h *renewalRestartHub) writeCredential(t *testing.T, id string, metadata ma
 	if errMarshal != nil {
 		t.Fatal(errMarshal)
 	}
+	if errMkdir := os.MkdirAll(filepath.Dir(h.path(id)), 0o700); errMkdir != nil {
+		t.Fatal(errMkdir)
+	}
 	if errWrite := os.WriteFile(h.path(id), data, 0o600); errWrite != nil {
 		t.Fatal(errWrite)
 	}
@@ -66,18 +69,44 @@ func (h *renewalRestartHub) loadCredential(t *testing.T, id, provider string) *A
 	}
 }
 
-// start boots a fresh Manager: register every credential file, then restore
-// the persisted runtime state, as service startup does.
+// renewalFileAuthStore lists the hub's credential files, like the file token store.
+type renewalFileAuthStore struct {
+	t        *testing.T
+	hub      *renewalRestartHub
+	provider string
+	ids      []string
+}
+
+func (s *renewalFileAuthStore) List(context.Context) ([]*Auth, error) {
+	auths := make([]*Auth, 0, len(s.ids))
+	for _, id := range s.ids {
+		auths = append(auths, s.hub.loadCredential(s.t, id, s.provider))
+	}
+	return auths, nil
+}
+
+func (s *renewalFileAuthStore) Save(context.Context, *Auth) (string, error) { return "", nil }
+
+func (s *renewalFileAuthStore) Delete(context.Context, string) error { return nil }
+
+// load boots a fresh Manager over the credential files and state store, without
+// restoring state yet.
+func (h *renewalRestartHub) load(t *testing.T, store CooldownStateStore, exec ProviderExecutor, provider string, ids ...string) *Manager {
+	t.Helper()
+	m := NewManager(&renewalFileAuthStore{t: t, hub: h, provider: provider, ids: ids}, &FillFirstSelector{}, nil)
+	m.SetCooldownStateStore(store)
+	m.RegisterExecutor(exec)
+	if errLoad := m.Load(context.Background()); errLoad != nil {
+		t.Fatalf("Load: %v", errLoad)
+	}
+	return m
+}
+
+// start boots a fresh Manager as service startup does: load the credential
+// files, then restore the persisted runtime state.
 func (h *renewalRestartHub) start(t *testing.T, exec ProviderExecutor, provider string, ids ...string) *Manager {
 	t.Helper()
-	m := NewManager(nil, &FillFirstSelector{}, nil)
-	m.SetCooldownStateStore(h.store)
-	m.RegisterExecutor(exec)
-	for _, id := range ids {
-		if _, errRegister := m.Register(context.Background(), h.loadCredential(t, id, provider)); errRegister != nil {
-			t.Fatalf("register %s: %v", id, errRegister)
-		}
-	}
+	m := h.load(t, h.store, exec, provider, ids...)
 	if errRestore := m.RestoreCooldownStates(context.Background()); errRestore != nil {
 		t.Fatalf("RestoreCooldownStates: %v", errRestore)
 	}
@@ -186,6 +215,13 @@ func assertRestoredRefreshError(t *testing.T, before, after *Error) {
 	if after.Code != code || after.HTTPStatus != before.HTTPStatus || after.Retryable != before.Retryable || after.Message != restoredRenewalErrorMessage(code) {
 		t.Fatalf("RefreshError after restart = %+v, want code %q status %d retryable %v with the local message", after, code, before.HTTPStatus, before.Retryable)
 	}
+}
+
+func authHasRenewalState(auth *Auth) bool {
+	return auth != nil && (auth.RequiresSignIn || auth.RefreshError != nil || !auth.RenewalEventAt.IsZero() ||
+		auth.RejectedAccessToken != "" || auth.RejectedSIWCAccessToken != "" ||
+		auth.RejectedRefreshToken != "" || auth.RejectedSIWCRefreshToken != "" ||
+		auth.RenewalWarnedRefreshToken != "")
 }
 
 func assertNoRenewalState(t *testing.T, auth *Auth) {

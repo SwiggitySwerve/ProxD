@@ -185,6 +185,17 @@ func readCooldownStateFile(ctx context.Context, path string) ([]CooldownStateRec
 
 // Save atomically writes one cooldown state file per auth and removes stale files.
 func (s *FileCooldownStateStore) Save(ctx context.Context, records []CooldownStateRecord) error {
+	return s.save(ctx, records, nil, true)
+}
+
+// SaveScoped writes the state files of owners only: each owner's file gets its
+// records, or is removed when it has none. Files of other credentials, such as
+// one that is not registered yet, are left untouched.
+func (s *FileCooldownStateStore) SaveScoped(ctx context.Context, records, owners []CooldownStateRecord) error {
+	return s.save(ctx, records, owners, false)
+}
+
+func (s *FileCooldownStateStore) save(ctx context.Context, records, owners []CooldownStateRecord, pruneAll bool) error {
 	if s == nil || s.dir == "" {
 		return nil
 	}
@@ -211,7 +222,7 @@ func (s *FileCooldownStateStore) Save(ctx context.Context, records []CooldownSta
 		groups[path] = append(groups[path], record)
 	}
 
-	if len(groups) == 0 {
+	if len(groups) == 0 && pruneAll {
 		return s.removeAllStateFiles(ctx)
 	}
 	if errMkdir := os.MkdirAll(s.dir, 0o700); errMkdir != nil {
@@ -225,7 +236,34 @@ func (s *FileCooldownStateStore) Save(ctx context.Context, records []CooldownSta
 		}
 		desired[filepath.Clean(path)] = struct{}{}
 	}
-	return s.removeStaleStateFiles(ctx, desired)
+	if pruneAll {
+		return s.removeStaleStateFiles(ctx, desired)
+	}
+	for _, owner := range owners {
+		path, errPath := s.statePath(owner)
+		if _, written := desired[filepath.Clean(path)]; errPath != nil || written {
+			continue
+		}
+		if errRemove := os.Remove(path); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
+			return fmt.Errorf("remove cooldown state %s: %w", path, errRemove)
+		}
+	}
+	return nil
+}
+
+// LoadAuth reads the state file of the credential owner describes.
+func (s *FileCooldownStateStore) LoadAuth(ctx context.Context, owner CooldownStateRecord) ([]CooldownStateRecord, error) {
+	if s == nil || s.dir == "" {
+		return nil, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	path, errPath := s.statePath(owner)
+	if errPath != nil {
+		return nil, errPath
+	}
+	return readCooldownStateFile(ctx, path)
 }
 
 func writeCooldownStateGroup(ctx context.Context, path string, records []CooldownStateRecord) error {

@@ -202,6 +202,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		auth.AdoptedGrantHash = AuthGrantFingerprint(auth)
 	}
 	auth.UpdatedAt = now
+	m.restoreRenewalStateFromStore(ctx, auth)
 	cooldownStateChanged := normalizeModelStates(auth)
 	seedInitialForceCooldownDeadlines(auth)
 	if auth.Disabled || auth.Status == StatusDisabled {
@@ -245,7 +246,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 			updateAggregatedAvailability(auth, now)
 		}
 	}
-	m.takePendingRenewalStateLocked(auth)
+	cooldownStateChanged = !renewalStateRecordEqual(renewalStateRecordOf(m.auths[auth.ID]), renewalStateRecordOf(auth)) || cooldownStateChanged
 	auth.ClearFileSnapshot()
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
@@ -269,7 +270,6 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
 	}
-	m.persistRenewalStateIfChanged(auth.ID)
 	return auth.Clone(), nil
 }
 
@@ -380,7 +380,6 @@ func (m *Manager) finishAuthUpdate(ctx context.Context, committed *Auth, persist
 	if persistCooldown {
 		m.persistCooldownStates(context.Background())
 	}
-	m.persistRenewalStateIfChanged(committed.ID)
 }
 
 // updateInternalLocked assumes the caller already holds the per-auth
@@ -768,6 +767,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	if shouldForgetWeighted {
 		m.forgetWeightedAuthUpTo(authClone.ID, forgetEpoch, forgetGen)
 	}
+	cooldownStateChanged = !renewalStateRecordEqual(renewalStateRecordOf(existingBeforeSave), renewalStateRecordOf(authClone)) || cooldownStateChanged
 	return auth.Clone(), true, cooldownStateChanged, nil
 }
 
@@ -815,15 +815,13 @@ func (m *Manager) RemoveIf(ctx context.Context, id string, predicate func(*Auth)
 	m.mu.Lock()
 	existing := m.auths[id]
 	if existing == nil {
-		_, hadPending := m.pendingRenewalStates[id]
-		delete(m.pendingRenewalStates, id)
 		m.mu.Unlock()
-		if hadPending {
-			m.persistCooldownStates(context.Background())
-		}
 		return false
 	}
-	delete(m.pendingRenewalStates, id)
+	if m.cooldownStore != nil {
+		// The next save removes this credential's state file.
+		m.removedCooldownOwners = append(m.removedCooldownOwners, CooldownStateRecord{AuthID: id, AuthFile: cooldownAuthFile(existing)})
+	}
 	provider := strings.TrimSpace(existing.Provider)
 	delete(m.auths, id)
 	m.notifyAuthChangeLocked(id)

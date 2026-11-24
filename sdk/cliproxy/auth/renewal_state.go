@@ -4,8 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"reflect"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -68,13 +68,6 @@ func renewalGrantSHA256(auth *Auth) string {
 	}, "\x00"))
 }
 
-func authHasRenewalState(auth *Auth) bool {
-	return auth != nil && (auth.RequiresSignIn || auth.RefreshError != nil || !auth.RenewalEventAt.IsZero() ||
-		auth.RejectedAccessToken != "" || auth.RejectedSIWCAccessToken != "" ||
-		auth.RejectedRefreshToken != "" || auth.RejectedSIWCRefreshToken != "" ||
-		auth.RenewalWarnedRefreshToken != "")
-}
-
 // persistedRenewalErrorCode returns code when it is a known safe OAuth or
 // renewal code, and "refresh_failed" otherwise.
 func persistedRenewalErrorCode(code string) string {
@@ -123,19 +116,9 @@ func renewalStateRecordOf(auth *Auth) *RenewalStateRecord {
 	return record
 }
 
+// renewalStateRecordEqual compares records built from runtime state.
 func renewalStateRecordEqual(a, b *RenewalStateRecord) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	return a.RequiresSignIn == b.RequiresSignIn &&
-		cooldownErrorEqual(a.RefreshError, b.RefreshError) &&
-		a.RenewalEventAt.Equal(b.RenewalEventAt) &&
-		a.GrantSHA256 == b.GrantSHA256 &&
-		a.RejectedAccessTokenSHA256 == b.RejectedAccessTokenSHA256 &&
-		a.RejectedSIWCAccessTokenSHA256 == b.RejectedSIWCAccessTokenSHA256 &&
-		a.RejectedRefreshTokenSHA256 == b.RejectedRefreshTokenSHA256 &&
-		a.RejectedSIWCRefreshTokenSHA256 == b.RejectedSIWCRefreshTokenSHA256 &&
-		a.RenewalWarnedRefreshTokenSHA256 == b.RenewalWarnedRefreshTokenSHA256
+	return reflect.DeepEqual(a, b)
 }
 
 // attachRenewalStateLocked adds the auth's renewal state to its auth-level
@@ -181,7 +164,7 @@ func matchRenewalToken(fingerprint string, candidates ...string) string {
 // rejected refresh token is still present. Status and availability are not
 // touched: the access-token eligibility rules decide whether it can serve.
 func restoreRenewalState(auth *Auth, saved *RenewalStateRecord) bool {
-	if auth == nil || saved == nil || authHasRenewalState(auth) {
+	if auth == nil || saved == nil || renewalStateRecordOf(auth) != nil {
 		return false
 	}
 	outerRT := authRefreshToken(auth)
@@ -212,131 +195,82 @@ func restoreRenewalState(auth *Auth, saved *RenewalStateRecord) bool {
 	}
 	auth.RejectedAccessToken = rejectedAT
 	auth.RejectedSIWCAccessToken = rejectedSIWCAT
-	if !authHasRenewalState(auth) {
+	return renewalStateRecordOf(auth) != nil
+}
+
+// renewalRestoreBaseline is what a loaded renewal record may be restored over:
+// the credential's tokens and its renewal state when the load began.
+type renewalRestoreBaseline struct {
+	grant   string
+	renewal *RenewalStateRecord
+}
+
+// renewalRestoreBaselinesLocked captures the baseline of every registered auth.
+// Callers hold m.mu.
+func (m *Manager) renewalRestoreBaselinesLocked() map[string]renewalRestoreBaseline {
+	baselines := make(map[string]renewalRestoreBaseline, len(m.auths))
+	for id, auth := range m.auths {
+		if auth != nil {
+			baselines[id] = renewalRestoreBaseline{grant: renewalGrantSHA256(auth), renewal: renewalStateRecordOf(auth)}
+		}
+	}
+	return baselines
+}
+
+// restoreRenewalStateLocked restores a loaded renewal record into a registered
+// auth whose tokens and renewal state did not change while the records were
+// loading: otherwise the loaded copy may be older than the current state.
+// Callers hold m.mu.
+func (m *Manager) restoreRenewalStateLocked(record CooldownStateRecord, baselines map[string]renewalRestoreBaseline) bool {
+	authID := strings.TrimSpace(record.AuthID)
+	auth := m.auths[authID]
+	baseline, ok := baselines[authID]
+	if auth == nil || !ok || strings.TrimSpace(record.Model) != "" || baseline.grant != renewalGrantSHA256(auth) ||
+		!renewalStateRecordEqual(baseline.renewal, renewalStateRecordOf(auth)) || !restoreRenewalState(auth, record.Renewal) {
 		return false
 	}
 	auth.Generation++
 	return true
 }
 
-// renewalRestoreFence identifies the runtime auth a renewal restore may write:
-// the same published object at the same generation as when the load began.
-type renewalRestoreFence struct {
-	auth       *Auth
-	generation uint64
-}
-
-// renewalRestoreFencesLocked captures the fence for every registered auth.
-// Callers hold m.mu.
-func (m *Manager) renewalRestoreFencesLocked() map[string]renewalRestoreFence {
-	fences := make(map[string]renewalRestoreFence, len(m.auths))
-	for id, auth := range m.auths {
-		if auth != nil {
-			fences[id] = renewalRestoreFence{auth: auth, generation: auth.Generation}
-		}
-	}
-	return fences
-}
-
-// restoreRenewalStateLocked restores a loaded renewal record. An auth that
-// changed while the records were loading is skipped: the loaded copy may be
-// older than its current state. A record whose auth is not registered yet is
-// kept so a later registration can use it and later saves keep it on disk.
-// Callers hold m.mu.
-func (m *Manager) restoreRenewalStateLocked(record CooldownStateRecord, fences map[string]renewalRestoreFence) bool {
-	authID := strings.TrimSpace(record.AuthID)
-	if record.Renewal == nil || authID == "" || strings.TrimSpace(record.Model) != "" {
-		return false
-	}
-	auth := m.auths[authID]
-	if auth == nil {
-		if _, known := fences[authID]; !known {
-			if m.pendingRenewalStates == nil {
-				m.pendingRenewalStates = make(map[string]pendingRenewalState)
-			}
-			m.pendingRenewalStates[authID] = pendingRenewalState{provider: strings.TrimSpace(record.Provider), renewal: record.Renewal}
-		}
-		return false
-	}
-	if fence, ok := fences[authID]; !ok || fence.auth != auth || fence.generation != auth.Generation {
-		return false
-	}
-	return restoreRenewalState(auth, record.Renewal)
-}
-
-// pendingRenewalState is a loaded renewal record whose auth is not registered.
-type pendingRenewalState struct {
-	provider string
-	renewal  *RenewalStateRecord
-}
-
-// pendingRenewalRecordsLocked returns renewal-only records for pending states
-// so saves keep them. Callers hold m.mu.
-func (m *Manager) pendingRenewalRecordsLocked() []CooldownStateRecord {
-	records := make([]CooldownStateRecord, 0, len(m.pendingRenewalStates))
-	for authID, pending := range m.pendingRenewalStates {
-		if m.auths[authID] != nil {
-			continue
-		}
-		records = append(records, CooldownStateRecord{Provider: pending.provider, AuthID: authID, Status: "renewal", Renewal: pending.renewal})
-	}
-	return records
-}
-
-// takePendingRenewalStateLocked restores and forgets the pending renewal state
-// of a newly registered auth. Callers hold m.mu.
-func (m *Manager) takePendingRenewalStateLocked(auth *Auth) {
-	if auth == nil {
-		return
-	}
-	pending, ok := m.pendingRenewalStates[auth.ID]
-	if !ok {
-		return
-	}
-	delete(m.pendingRenewalStates, auth.ID)
-	restoreRenewalState(auth, pending.renewal)
-}
-
-// renewalSavedState holds the renewal state of the last successful cooldown
-// state save, keyed by auth ID. Its own lock lets a caller see that nothing
-// changed without waiting behind a save in progress.
-type renewalSavedState struct {
-	mu      sync.Mutex
-	records map[string]*RenewalStateRecord
-}
-
-// noteRenewalStatesSaved records the renewal state written by a successful save.
-func (m *Manager) noteRenewalStatesSaved(records []CooldownStateRecord) {
-	saved := make(map[string]*RenewalStateRecord)
-	for _, record := range records {
-		if record.Renewal != nil {
-			saved[record.AuthID] = record.Renewal
-		}
-	}
-	m.renewalSaved.mu.Lock()
-	m.renewalSaved.records = saved
-	m.renewalSaved.mu.Unlock()
-}
-
-// persistRenewalStateIfChanged saves runtime state when the auth's renewal
-// state differs from the last saved copy, including when it was cleared or the
-// auth was removed. Callers must not hold m.mu or configCooldownMu.
-func (m *Manager) persistRenewalStateIfChanged(authID string) {
-	if m == nil || authID == "" {
-		return
-	}
+// restoreRenewalStateFromStore restores a newly registered auth's renewal state
+// from its own state file, when the store can read one file. Callers must not
+// hold m.mu.
+func (m *Manager) restoreRenewalStateFromStore(ctx context.Context, auth *Auth) {
 	m.mu.RLock()
-	store := m.cooldownStore
-	current := renewalStateRecordOf(m.auths[authID])
+	store, ok := m.cooldownStore.(cooldownStateScopedStore)
 	m.mu.RUnlock()
-	if store == nil {
+	if !ok || auth == nil {
 		return
 	}
-	m.renewalSaved.mu.Lock()
-	unchanged := renewalStateRecordEqual(m.renewalSaved.records[authID], current)
-	m.renewalSaved.mu.Unlock()
-	if unchanged {
+	records, errLoad := store.LoadAuth(ctx, CooldownStateRecord{AuthID: auth.ID, AuthFile: cooldownAuthFile(auth)})
+	if errLoad != nil {
 		return
 	}
-	m.persistCooldownStates(context.Background())
+	for _, record := range records {
+		if record.AuthID == auth.ID && strings.TrimSpace(record.Model) == "" && restoreRenewalState(auth, record.Renewal) {
+			return
+		}
+	}
+}
+
+// cooldownStateScopedStore saves only the state files of registered or removed
+// credentials and reads one credential's state file.
+type cooldownStateScopedStore interface {
+	SaveScoped(ctx context.Context, records, owners []CooldownStateRecord) error
+	LoadAuth(ctx context.Context, owner CooldownStateRecord) ([]CooldownStateRecord, error)
+}
+
+// authCannotObtainAccessToken reports that the auth holds refresh grants, all
+// known rejected, and no other credential (API key or Meta device token) from
+// which an access token could be obtained.
+func authCannotObtainAccessToken(auth *Auth) bool {
+	if auth == nil || (authRefreshToken(auth) == "" && authSIWCTokenField(auth, "refresh_token") == "") {
+		return false
+	}
+	if authMetadataString(auth, "api_key") != "" || authMetadataString(auth, "dca_token") != "" ||
+		(auth.Attributes != nil && (strings.TrimSpace(auth.Attributes[AttributeAPIKey]) != "" || strings.TrimSpace(auth.Attributes["dca_token"]) != "")) {
+		return false
+	}
+	return authHasUnchangedRejectedRefreshToken(auth)
 }

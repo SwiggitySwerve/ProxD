@@ -1262,12 +1262,12 @@ func (m *Manager) markRejectedAccessToken(id, failedAccessToken string) {
 	if m == nil || id == "" || failedAccessToken == "" {
 		return
 	}
-	// Deferred first so it runs after the gate and m.mu are released.
-	defer m.persistRenewalStateIfChanged(id)
 	releaseMutation := m.lockAuthMutation(id)
 	defer releaseMutation()
+	marked := false
 	m.mu.Lock()
 	if current := m.auths[id]; current != nil && recordRejectedTokenOnAuth(current, failedAccessToken) {
+		marked = true
 		current.Generation++
 		current.UpdatedAt = time.Now()
 		m.auths[id] = current
@@ -1276,6 +1276,10 @@ func (m *Manager) markRejectedAccessToken(id, failedAccessToken string) {
 		}
 	}
 	m.mu.Unlock()
+	if marked {
+		releaseMutation()
+		m.persistCooldownStates(context.Background())
+	}
 }
 
 func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAccessToken string, registrationEpoch uint64) (*Auth, error) {
@@ -1294,8 +1298,6 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	if id == "" {
 		return nil, errors.New("auth id is empty")
 	}
-	// Deferred first so it runs after the refresh lock is released.
-	defer m.persistRenewalStateIfChanged(id)
 	if failedAccessToken != "" {
 		m.markRejectedAccessToken(id, failedAccessToken)
 	}
@@ -1504,6 +1506,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		shouldReschedule := false
 		isDisabled := false
 		shouldUnschedule := false
+		renewalChanged := false
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			if base != nil && (current.RegistrationEpoch != base.RegistrationEpoch || current.CredentialVersion != base.CredentialVersion || secretGrantChanged(base, current)) {
@@ -1514,6 +1517,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 				m.mu.Unlock()
 				return nil, err
 			}
+			renewalBefore := renewalStateRecordOf(current)
 			terminalRefresh := isTerminalRefreshError(current, err)
 			sanitizedRefreshErr := sanitizeRenewalError(current, err)
 			wasTerminalUnauthorized := hasUnauthorizedAuthFailure(current)
@@ -1538,7 +1542,11 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 				if m.scheduler != nil {
 					m.scheduler.upsertAuth(current.Clone())
 				}
+				renewalChanged := !renewalStateRecordEqual(renewalBefore, renewalStateRecordOf(current))
 				m.mu.Unlock()
+				if renewalChanged {
+					m.persistCooldownStates(context.Background())
+				}
 				m.queueRefreshUnschedule(id)
 				return nil, err
 			}
@@ -1697,8 +1705,12 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 			if m.scheduler != nil {
 				m.scheduler.upsertAuth(current.Clone())
 			}
+			renewalChanged = !renewalStateRecordEqual(renewalBefore, renewalStateRecordOf(current))
 		}
 		m.mu.Unlock()
+		if renewalChanged {
+			m.persistCooldownStates(context.Background())
+		}
 		if shouldReschedule {
 			m.queueRefreshReschedule(id)
 		} else if shouldUnschedule {
