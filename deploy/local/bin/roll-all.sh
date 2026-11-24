@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # roll-all.sh [--dry-run] --approved <image-tag>
 #
-# Rolls the three live hubs (codex, claude, gemini) to <image-tag> one at a time, through
-# roll.sh, with every condition the live host needs built in:
+# Rolls every live hub to <image-tag> one at a time, through roll.sh, with every condition
+# the live host needs built in. The hubs are discovered, never listed: each proxd-*.container
+# quadlet that declares Environment=CLIPROXY_INSTANCE_ID= and whose unit is not masked (a
+# hub taken out of service keeps its quadlet but is masked, as gemini was on 2026-11-22).
+#
 #
 #   - It runs inside its own `systemd-run --user` unit (idle IO class, nice 10). Started
 #     from a shell, it re-executes itself there and follows the unit's log file, so a
@@ -36,7 +39,11 @@ ROLL=$BIN/roll.sh
 UNIT_DIR=${LIVE_UNIT_DIR:-$HOME/.config/containers/systemd}
 DATA_ROOT=${LIVE_DATA_ROOT:-$HOME/.local/share/proxd}
 EXPORTER_URL=${EXPORTER_URL:-http://127.0.0.1:9787/metrics}
-HUBS="codex claude gemini"
+HUBS=""  # discovered by read_quadlets
+# Order only, never membership: these discovered hubs roll first, in this order, and any
+# other discovered hub follows alphabetically. codex goes first so the image proves itself
+# before proxd-claude, which carries the operator's own Claude sessions, restarts.
+ROLL_ORDER=${ROLL_ORDER:-codex claude}
 # UTC; 04:20 is prox-usage-nightly.
 NIGHTLY_WINDOWS="01:00-04:00 04:20-07:00 12:20-13:00"
 WINDOW_MARGIN_MIN=${WINDOW_MARGIN_MIN:-20}
@@ -146,8 +153,29 @@ unit_image() { sed -n 's/^Image=//p' "$(unit_path "$1")" | head -n1; }
 unit_instance() { sed -n 's/^Environment=CLIPROXY_INSTANCE_ID=//p' "$(unit_path "$1")" | head -n1; }
 
 declare -A PREV INSTANCE
+discover_hubs() {
+  local unit hub found=" " ordered=""
+  for unit in "$UNIT_DIR"/proxd-*.container; do
+    [ -f "$unit" ] && grep -q '^Environment=CLIPROXY_INSTANCE_ID=' "$unit" || continue
+    hub=${unit##*/proxd-}
+    hub=${hub%.container}
+    if [ "$(systemctl --user is-enabled "proxd-$hub" 2>/dev/null || true)" = masked ]; then
+      log "proxd-$hub is masked; not a live hub, not rolled"
+      continue
+    fi
+    found="$found$hub "
+  done
+  for hub in $ROLL_ORDER; do
+    [[ $found == *" $hub "* ]] && ordered="${ordered:+$ordered }$hub" && found=${found/ $hub / }
+  done
+  for hub in $found; do ordered="${ordered:+$ordered }$hub"; done
+  HUBS=$ordered
+  [ -n "$HUBS" ] || die "no hub quadlets (proxd-*.container with CLIPROXY_INSTANCE_ID) in $UNIT_DIR"
+}
+
 read_quadlets() {
   local hub
+  discover_hubs
   for hub in $HUBS; do
     [ -f "$(unit_path "$hub")" ] || die "unit file $(unit_path "$hub") not found"
     PREV[$hub]=$(unit_image "$hub")
