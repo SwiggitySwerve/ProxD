@@ -560,3 +560,133 @@ func TestRenewalPersist_RejectionDuringReplacementSaveIsCleared(t *testing.T) {
 		t.Fatalf("rejection of the replaced tokens left on disk: %+v", record)
 	}
 }
+
+// cooldownRecordFor returns the auth-level cooldown record of id on disk.
+func (h *renewalRestartHub) cooldownRecordFor(t *testing.T, id string) *CooldownStateRecord {
+	t.Helper()
+	records, errLoad := h.store.Load(context.Background())
+	if errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	for i := range records {
+		if records[i].AuthID == id && records[i].Model == "" && !records[i].NextRetryAfter.IsZero() {
+			return &records[i]
+		}
+	}
+	return nil
+}
+
+func startCoolingCredential(t *testing.T, hub *renewalRestartHub, id string, refreshErr error) *Manager {
+	t.Helper()
+	hub.writeCredential(t, id, map[string]any{"type": "claude", "access_token": "cooling-at-1", "refresh_token": "cooling-rt-1", "expired": time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)})
+	m := hub.start(t, &unauthorizedRefreshExecutor{id: "claude", refreshErr: refreshErr}, "claude", id)
+	retryAfter := 30 * time.Minute
+	m.MarkResult(context.Background(), Result{AuthID: id, Provider: "claude", CredentialScope: true, RetryAfter: &retryAfter, Error: &Error{HTTPStatus: 429, Message: "quota exceeded for org-visible"}})
+	if hub.cooldownRecordFor(t, id) == nil {
+		t.Fatal("precondition: no credential cooldown on disk")
+	}
+	return m
+}
+
+// S1 (round 4): a refresh failure's text stays off disk after a replacement
+// credential clears the refresh error.
+func TestRenewalPersist_RefreshErrorTextOffDiskAfterReplacement(t *testing.T) {
+	ctx := context.Background()
+	hub := newRenewalRestartHub(t)
+	id := "claude-transient-replaced.json"
+	m := startCoolingCredential(t, hub, id, errors.New("token refresh failed with status 503: upstream opaqueTransientSecret5 unavailable"))
+	m.refreshAuth(ctx, id)
+	replacement := getAuth(t, m, id)
+	replacement.Metadata["access_token"] = "cooling-at-2"
+	replacement.Metadata["refresh_token"] = "cooling-rt-2"
+	if _, errUpdate := m.Update(ctx, replacement); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	current := getAuth(t, m, id)
+	if current.RefreshError != nil || current.LastError == nil || !strings.Contains(current.LastError.Message, "opaqueTransientSecret5") {
+		t.Fatalf("precondition: RefreshError=%+v LastError=%+v", current.RefreshError, current.LastError)
+	}
+	m.PersistCooldownStates(ctx)
+	hub.assertNoTokensPersisted(t, "opaqueTransientSecret5", "cooling-at-2", "cooling-rt-2")
+}
+
+// S1 (round 4): a terminal refresh failure during a replacement's save keeps
+// its text off disk.
+func TestRenewalPersist_TerminalRefreshDuringReplacementSaveTextOffDisk(t *testing.T) {
+	ctx := context.Background()
+	hub := newRenewalRestartHub(t)
+	id := "claude-terminal-replaced.json"
+	m := startCoolingCredential(t, hub, id, errors.New(`token refresh failed with status 400: {"error": "invalid_grant", "error_description": "Refresh token expired opaqueTerminalSecret6"}`))
+	entered, release := make(chan struct{}, 1), make(chan struct{})
+	m.SetStore(&renewalFileAuthStore{t: t, hub: hub, provider: "claude", ids: []string{id}, onSave: func() {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+	}})
+	replacement := getAuth(t, m, id)
+	replacement.Metadata["access_token"] = "cooling-at-2"
+	replacement.Metadata["refresh_token"] = "cooling-rt-2"
+	done := make(chan struct{})
+	go func() {
+		if _, errUpdate := m.Update(ctx, replacement); errUpdate != nil {
+			t.Error(errUpdate)
+		}
+		close(done)
+	}()
+	<-entered
+	m.refreshAuth(ctx, id)
+	close(release)
+	<-done
+	m.PersistCooldownStates(ctx)
+	hub.assertNoTokensPersisted(t, "opaqueTerminalSecret6", "error_description", "cooling-at-2", "cooling-rt-2")
+}
+
+// S1 (round 4): a request error keeps today's persisted message even while a
+// refresh failure is recorded.
+func TestRenewalPersist_RequestErrorMessageUnchanged(t *testing.T) {
+	ctx := context.Background()
+	hub := newRenewalRestartHub(t)
+	id := "claude-request-429.json"
+	hub.writeCredential(t, id, map[string]any{"type": "claude", "access_token": "req-at", "refresh_token": "req-rt", "expired": time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)})
+	m := hub.start(t, &unauthorizedRefreshExecutor{id: "claude", refreshErr: errors.New("token refresh failed with status 503: upstream unavailable")}, "claude", id)
+	m.refreshAuth(ctx, id)
+	if getAuth(t, m, id).RefreshError == nil {
+		t.Fatal("precondition: no refresh failure recorded")
+	}
+	retryAfter := 30 * time.Minute
+	m.MarkResult(ctx, Result{AuthID: id, Provider: "claude", CredentialScope: true, RetryAfter: &retryAfter, Error: &Error{HTTPStatus: 429, Message: "quota exceeded for org-visible"}})
+	record := hub.cooldownRecordFor(t, id)
+	if record == nil || record.LastError == nil || record.LastError.Message != "quota exceeded for org-visible" {
+		t.Fatalf("persisted request error = %+v, want its message kept", record)
+	}
+}
+
+// S10 (round 4): credentials whose file names map to one state file share it,
+// as before this change, and both decisions survive a restart.
+func TestRenewalPersist_CollidingCredentialsShareStateFile(t *testing.T) {
+	ctx := context.Background()
+	hub := newRenewalRestartHub(t)
+	first, second := "a_b.json", "a b.json"
+	expiry := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	hub.writeCredential(t, first, map[string]any{"type": "claude", "access_token": "first-at", "refresh_token": "first-rt", "expired": expiry})
+	hub.writeCredential(t, second, map[string]any{"type": "claude", "access_token": "second-at", "refresh_token": "second-rt", "expired": expiry})
+	m1 := hub.start(t, &unauthorizedRefreshExecutor{id: "claude", refreshErr: errors.New(claudeRefreshExpiredErr)}, "claude", first, second)
+	m1.refreshAuth(ctx, first)
+	m1.refreshAuth(ctx, second)
+
+	m2 := hub.start(t, &unauthorizedRefreshExecutor{id: "claude"}, "claude", first, second)
+	for _, id := range []string{first, second} {
+		if !getAuth(t, m2, id).RequiresSignIn {
+			t.Fatalf("%s lost its sign-in decision on restart", id)
+		}
+	}
+	m2.Remove(ctx, first)
+	if hub.renewalRecord(t, first) != nil {
+		t.Fatal("removed credential's record remains")
+	}
+	if record := hub.renewalRecord(t, second); record == nil || !record.RequiresSignIn {
+		t.Fatalf("removing one credential dropped the other's record: %+v", record)
+	}
+}

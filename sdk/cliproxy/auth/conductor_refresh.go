@@ -1535,7 +1535,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 					if current.RenewalEventAt.IsZero() {
 						current.RenewalEventAt = now
 					}
-					current.LastError = &Error{Code: "unauthorized", Message: sanitizedRefreshErr.Message, HTTPStatus: http.StatusUnauthorized}
+					current.LastError = markRefreshOriginated(&Error{Code: "unauthorized", Message: sanitizedRefreshErr.Message, HTTPStatus: http.StatusUnauthorized})
 					current.StatusMessage = "unauthorized (refresh token invalid)"
 				}
 				m.auths[id] = current
@@ -1625,7 +1625,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 				current.NextRefreshAfter = time.Time{}
 				current.NextRetryAfter = time.Time{}
 				current.RefreshFailures = 0
-				current.LastError = &Error{Code: "unauthorized", Message: sanitizedRefreshErr.Message, HTTPStatus: http.StatusUnauthorized}
+				current.LastError = markRefreshOriginated(&Error{Code: "unauthorized", Message: sanitizedRefreshErr.Message, HTTPStatus: http.StatusUnauthorized})
 				if unauthorized && !invalidGrant {
 					current.StatusMessage = "unauthorized"
 				} else {

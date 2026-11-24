@@ -276,19 +276,31 @@ func authCannotObtainAccessToken(auth *Auth) bool {
 	return authHasUnchangedRejectedRefreshToken(auth)
 }
 
+// errorOriginMetadataKey marks, with the value "refresh", an Error built from a
+// credential refresh failure.
+const errorOriginMetadataKey = "error_origin"
+
+func markRefreshOriginated(err *Error) *Error {
+	if err.Metadata == nil {
+		err.Metadata = make(map[string]string, 1)
+	}
+	err.Metadata[errorOriginMetadataKey] = "refresh"
+	return err
+}
+
 // withoutRefreshDiagnostics keeps refresh failure text out of a persisted
-// auth-level cooldown record: while a refresh failure is recorded, its error
-// message and a reason copied from it carry local text instead.
+// auth-level cooldown record: an error built from a refresh failure, and a
+// reason copied from refresh failure text, carry local text instead.
 func withoutRefreshDiagnostics(auth *Auth, record CooldownStateRecord) CooldownStateRecord {
-	if auth.RefreshError == nil {
-		return record
-	}
 	const local = "credential refresh failed"
-	if record.Reason == auth.RefreshError.Message || (auth.LastError != nil && record.Reason == auth.LastError.Message) {
-		record.Reason = local
+	if lastErr := record.LastError; lastErr != nil && lastErr.Metadata[errorOriginMetadataKey] == "refresh" {
+		if record.Reason == lastErr.Message {
+			record.Reason = local
+		}
+		lastErr.Message = local
 	}
-	if record.LastError != nil {
-		record.LastError.Message = local
+	if auth.RefreshError != nil && record.Reason == auth.RefreshError.Message {
+		record.Reason = local
 	}
 	return record
 }

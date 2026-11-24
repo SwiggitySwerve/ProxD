@@ -222,7 +222,10 @@ func (s *FileCooldownStateStore) save(ctx context.Context, records, owners []Coo
 		groups[path] = append(groups[path], record)
 	}
 
-	if len(groups) == 0 && pruneAll {
+	if !pruneAll {
+		return s.saveScopedGroups(ctx, groups, owners)
+	}
+	if len(groups) == 0 {
 		return s.removeAllStateFiles(ctx)
 	}
 	if errMkdir := os.MkdirAll(s.dir, 0o700); errMkdir != nil {
@@ -231,24 +234,51 @@ func (s *FileCooldownStateStore) save(ctx context.Context, records, owners []Coo
 
 	desired := make(map[string]struct{}, len(groups))
 	for path, groupedRecords := range groups {
-		if !pruneAll && !cooldownStateFileOwnedBy(ctx, path, groupedRecords[0].AuthID) {
-			continue
-		}
 		if errSave := writeCooldownStateGroup(ctx, path, groupedRecords); errSave != nil {
 			return errSave
 		}
 		desired[filepath.Clean(path)] = struct{}{}
 	}
-	if pruneAll {
-		return s.removeStaleStateFiles(ctx, desired)
+	return s.removeStaleStateFiles(ctx, desired)
+}
+
+// saveScopedGroups rewrites the state files the owners map to. In each file
+// the owners' records are replaced by their new records, records of other
+// credentials sharing the file are kept, and the file is removed once empty.
+func (s *FileCooldownStateStore) saveScopedGroups(ctx context.Context, groups map[string][]CooldownStateRecord, owners []CooldownStateRecord) error {
+	owned := make(map[string]map[string]struct{})
+	own := func(path, authID string) {
+		if owned[path] == nil {
+			owned[path] = make(map[string]struct{})
+		}
+		owned[path][authID] = struct{}{}
 	}
 	for _, owner := range owners {
-		path, errPath := s.statePath(owner)
-		if _, written := desired[filepath.Clean(path)]; errPath != nil || written || !cooldownStateFileOwnedBy(ctx, path, owner.AuthID) {
+		if path, errPath := s.statePath(owner); errPath == nil {
+			own(path, owner.AuthID)
+		}
+	}
+	for path, groupedRecords := range groups {
+		for _, record := range groupedRecords {
+			own(path, record.AuthID)
+		}
+	}
+	for path, authIDs := range owned {
+		existing, _ := readCooldownStateFile(ctx, path)
+		merged := groups[path]
+		for _, record := range existing {
+			if _, replaced := authIDs[record.AuthID]; !replaced {
+				merged = append(merged, record)
+			}
+		}
+		if len(merged) == 0 {
+			if errRemove := os.Remove(path); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
+				return fmt.Errorf("remove cooldown state %s: %w", path, errRemove)
+			}
 			continue
 		}
-		if errRemove := os.Remove(path); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
-			return fmt.Errorf("remove cooldown state %s: %w", path, errRemove)
+		if errSave := writeCooldownStateGroup(ctx, path, merged); errSave != nil {
+			return errSave
 		}
 	}
 	return nil
@@ -267,14 +297,6 @@ func (s *FileCooldownStateStore) LoadAuth(ctx context.Context, owner CooldownSta
 		return nil, errPath
 	}
 	return readCooldownStateFile(ctx, path)
-}
-
-// cooldownStateFileOwnedBy reports whether the state file at path is absent or
-// belongs to authID, so a credential whose file name maps to the same path
-// never overwrites or removes another credential's state.
-func cooldownStateFileOwnedBy(ctx context.Context, path, authID string) bool {
-	records, errRead := readCooldownStateFile(ctx, path)
-	return errRead != nil || len(records) == 0 || records[0].AuthID == authID
 }
 
 func writeCooldownStateGroup(ctx context.Context, path string, records []CooldownStateRecord) error {

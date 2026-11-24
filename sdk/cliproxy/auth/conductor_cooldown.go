@@ -3323,7 +3323,7 @@ func refreshErrorFromError(err error) *Error {
 		authErr.Code = "unauthorized"
 		authErr.Retryable = false
 	}
-	return authErr
+	return markRefreshOriginated(authErr)
 }
 
 func retryAfterFromError(err error) *time.Duration {
