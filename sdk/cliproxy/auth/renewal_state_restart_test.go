@@ -75,6 +75,7 @@ type renewalFileAuthStore struct {
 	hub      *renewalRestartHub
 	provider string
 	ids      []string
+	onSave   func()
 }
 
 func (s *renewalFileAuthStore) List(context.Context) ([]*Auth, error) {
@@ -85,7 +86,12 @@ func (s *renewalFileAuthStore) List(context.Context) ([]*Auth, error) {
 	return auths, nil
 }
 
-func (s *renewalFileAuthStore) Save(context.Context, *Auth) (string, error) { return "", nil }
+func (s *renewalFileAuthStore) Save(context.Context, *Auth) (string, error) {
+	if s.onSave != nil {
+		s.onSave()
+	}
+	return "", nil
+}
 
 func (s *renewalFileAuthStore) Delete(context.Context, string) error { return nil }
 

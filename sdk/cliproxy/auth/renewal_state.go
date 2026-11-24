@@ -268,9 +268,27 @@ func authCannotObtainAccessToken(auth *Auth) bool {
 	if auth == nil || (authRefreshToken(auth) == "" && authSIWCTokenField(auth, "refresh_token") == "") {
 		return false
 	}
-	if authMetadataString(auth, "api_key") != "" || authMetadataString(auth, "dca_token") != "" ||
-		(auth.Attributes != nil && (strings.TrimSpace(auth.Attributes[AttributeAPIKey]) != "" || strings.TrimSpace(auth.Attributes["dca_token"]) != "")) {
+	if authMetadataString(auth, "api_key") != "" || (auth.Attributes != nil && strings.TrimSpace(auth.Attributes[AttributeAPIKey]) != "") ||
+		(strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") &&
+			(authMetadataString(auth, "dca_token") != "" || strings.TrimSpace(auth.Attributes["dca_token"]) != "")) {
 		return false
 	}
 	return authHasUnchangedRejectedRefreshToken(auth)
+}
+
+// withoutRefreshDiagnostics keeps refresh failure text out of a persisted
+// auth-level cooldown record: while a refresh failure is recorded, its error
+// message and a reason copied from it carry local text instead.
+func withoutRefreshDiagnostics(auth *Auth, record CooldownStateRecord) CooldownStateRecord {
+	if auth.RefreshError == nil {
+		return record
+	}
+	const local = "credential refresh failed"
+	if record.Reason == auth.RefreshError.Message || (auth.LastError != nil && record.Reason == auth.LastError.Message) {
+		record.Reason = local
+	}
+	if record.LastError != nil {
+		record.LastError.Message = local
+	}
+	return record
 }

@@ -465,3 +465,98 @@ func TestRenewalRestart_TransientRefreshErrorNotPersisted(t *testing.T) {
 		t.Fatalf("RenewalState after restart = %q", state)
 	}
 }
+
+// S1 (round 3): a terminal refresh during a credential cooldown keeps its
+// upstream diagnostics in memory but not in the cooldown record on disk.
+func TestRenewalPersist_CooldownRecordKeepsNoRefreshDiagnostics(t *testing.T) {
+	ctx := context.Background()
+	hub := newRenewalRestartHub(t)
+	id := "claude-cooling.json"
+	hub.writeCredential(t, id, map[string]any{"type": "claude", "access_token": "cool-at-secret", "refresh_token": "cool-rt-secret", "expired": time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)})
+	refreshErr := errors.New(`token refresh failed with status 400: {"error": "invalid_grant", "error_description": "Refresh token expired for grant opaqueCooldownSecret9"}`)
+	m := hub.start(t, &unauthorizedRefreshExecutor{id: "claude", refreshErr: refreshErr}, "claude", id)
+	retryAfter := 30 * time.Minute
+	m.MarkResult(ctx, Result{AuthID: id, Provider: "claude", CredentialScope: true, RetryAfter: &retryAfter, Error: &Error{HTTPStatus: 429, Message: "quota exceeded"}})
+	m.refreshAuth(ctx, id)
+	current := getAuth(t, m, id)
+	if !current.RequiresSignIn || current.LastError == nil || !strings.Contains(current.LastError.Message, "opaqueCooldownSecret9") || !current.NextRetryAfter.After(time.Now()) {
+		t.Fatalf("precondition: RequiresSignIn=%v LastError=%+v NextRetryAfter=%v", current.RequiresSignIn, current.LastError, current.NextRetryAfter)
+	}
+	hub.assertNoTokensPersisted(t, "cool-at-secret", "cool-rt-secret", "opaqueCooldownSecret9", "error_description")
+}
+
+// S2 (round 3): only Meta renews with a device token, so another provider's
+// device token does not exempt a credential whose grants are all rejected.
+func TestRenewalSelection_NonMetaDeviceTokenStaysBlocked(t *testing.T) {
+	auth := &Auth{ID: "claude-dca.json", Provider: "claude", Status: StatusActive, RequiresSignIn: true, RejectedRefreshToken: "claude-rt",
+		Metadata: map[string]any{"type": "claude", "dca_token": "dca-secret", "refresh_token": "claude-rt"}}
+	if blocked, _, _ := isAuthBlockedForModel(auth, "m", time.Now()); !blocked {
+		t.Fatal("non-Meta credential with a device token and a rejected refresh grant is selectable")
+	}
+}
+
+// S10: credentials whose file names map to the same state file never remove
+// or overwrite each other's state.
+func TestRenewalPersist_CollidingStateFileNamesKeepOwner(t *testing.T) {
+	ctx := context.Background()
+	hub := newRenewalRestartHub(t)
+	owner, other := "a b.json", "a_b.json"
+	expiry := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	hub.writeCredential(t, owner, map[string]any{"type": "claude", "access_token": "owner-at", "refresh_token": "owner-rt", "expired": expiry})
+	hub.writeCredential(t, other, map[string]any{"type": "claude", "access_token": "other-at", "refresh_token": "other-rt", "expired": expiry})
+	m1 := hub.start(t, &unauthorizedRefreshExecutor{id: "claude", refreshErr: errors.New(claudeRefreshExpiredErr)}, "claude", owner)
+	m1.refreshAuth(ctx, owner)
+	if hub.renewalRecord(t, owner) == nil {
+		t.Fatal("precondition: owner state not saved")
+	}
+
+	m2 := hub.start(t, &unauthorizedRefreshExecutor{id: "claude", refreshErr: errors.New(claudeRefreshExpiredErr)}, "claude", other)
+	m2.PersistCooldownStates(ctx)
+	if hub.renewalRecord(t, owner) == nil {
+		t.Fatal("a colliding credential with no state removed the owner's state file")
+	}
+	m2.refreshAuth(ctx, other)
+	if hub.renewalRecord(t, owner) == nil {
+		t.Fatal("a colliding credential overwrote the owner's state file")
+	}
+}
+
+// S7 (round 3): a rejection saved by a refresh while an Update is saving the
+// replacement credential is cleared on disk when the replacement is published.
+func TestRenewalPersist_RejectionDuringReplacementSaveIsCleared(t *testing.T) {
+	ctx := context.Background()
+	hub := newRenewalRestartHub(t)
+	id := "claude-replace.json"
+	hub.writeCredential(t, id, map[string]any{"type": "claude", "access_token": "repl-at-1", "refresh_token": "repl-rt-1", "expired": time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)})
+	m := hub.load(t, hub.store, &unauthorizedRefreshExecutor{id: "claude", refreshErr: errors.New(claudeRefreshExpiredErr)}, "claude", id)
+	entered, release := make(chan struct{}, 1), make(chan struct{})
+	m.SetStore(&renewalFileAuthStore{t: t, hub: hub, provider: "claude", ids: []string{id}, onSave: func() {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+	}})
+
+	replacement := getAuth(t, m, id)
+	replacement.Metadata["access_token"] = "repl-at-2"
+	replacement.Metadata["refresh_token"] = "repl-rt-2"
+	done := make(chan struct{})
+	go func() {
+		if _, errUpdate := m.Update(ctx, replacement); errUpdate != nil {
+			t.Error(errUpdate)
+		}
+		close(done)
+	}()
+	<-entered // the replacement is being saved
+	m.refreshAuth(ctx, id)
+	if hub.renewalRecord(t, id) == nil {
+		t.Fatal("precondition: the concurrent rejection was not saved")
+	}
+	close(release)
+	<-done
+	assertNoRenewalState(t, getAuth(t, m, id))
+	if record := hub.renewalRecord(t, id); record != nil {
+		t.Fatalf("rejection of the replaced tokens left on disk: %+v", record)
+	}
+}

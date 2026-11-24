@@ -1316,7 +1316,7 @@ func authCooldownStateRecord(auth *Auth, now time.Time) (CooldownStateRecord, bo
 	if auth.nonQuotaCooldownUntil.After(now) {
 		nonQuotaUntil = auth.nonQuotaCooldownUntil
 	}
-	return CooldownStateRecord{
+	return withoutRefreshDiagnostics(auth, CooldownStateRecord{
 		Provider:                    strings.TrimSpace(auth.Provider),
 		AuthID:                      auth.ID,
 		AuthFile:                    cooldownAuthFile(auth),
@@ -1333,7 +1333,7 @@ func authCooldownStateRecord(auth *Auth, now time.Time) (CooldownStateRecord, bo
 		ForceCooldownEvaluated:      true,
 		CredentialRetryAfter:        credentialRetryAfter,
 		NonQuotaCooldownUntil:       nonQuotaUntil,
-	}, true
+	}), true
 }
 
 func modelCooldownStateRecord(auth *Auth, model string, state *ModelState, now time.Time) (CooldownStateRecord, bool) {

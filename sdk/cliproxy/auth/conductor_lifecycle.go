@@ -747,6 +747,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	if existing.Generation >= auth.Generation {
 		auth.Generation = existing.Generation + 1
 	}
+	renewalChanged := !renewalStateRecordEqual(renewalStateRecordOf(m.auths[auth.ID]), renewalStateRecordOf(auth))
 	auth.ClearFileSnapshot()
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
@@ -767,8 +768,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	if shouldForgetWeighted {
 		m.forgetWeightedAuthUpTo(authClone.ID, forgetEpoch, forgetGen)
 	}
-	cooldownStateChanged = !renewalStateRecordEqual(renewalStateRecordOf(existingBeforeSave), renewalStateRecordOf(authClone)) || cooldownStateChanged
-	return auth.Clone(), true, cooldownStateChanged, nil
+	return auth.Clone(), true, cooldownStateChanged || renewalChanged, nil
 }
 
 func equalErrorPtr(a, b *Error) bool {
