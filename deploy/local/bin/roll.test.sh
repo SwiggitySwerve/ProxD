@@ -46,7 +46,7 @@ EOF
   done
   rm -rf "$T/data" "$T/calls" "$T/systemd-run.args" "$T/bad-hub" "$T/unsubscribed" "$T/unsub-hub" "$T/rebuilt" "$T/stale-ts" "$T/no-ts" \
     "$T/stale-boot" "$T/no-boot" "$T/boot-prefix" "$T/boot-gone" "$T"/masked-* \
-    "$T/units/proxd-meta.container" "$T/units/proxd-catalog.container"
+    "$T/units/proxd-meta.container" "$T/units/proxd-catalog.container" "$T/units/proxd-staging.container" "$T/state-unknown"
   mkdir -p "$T/data"
   : >"$T/calls"
 }
@@ -71,7 +71,7 @@ echo "systemctl $*" >>"$STUB/calls"
 case "$*" in
   "--user list-timers --all --output=json") cat "$STUB/timers.json" ;;
   "--user is-active "*) if [ -f "$STUB/active-$3" ]; then cat "$STUB/active-$3"; else echo inactive; exit 3; fi ;;
-  "--user is-enabled "*) if [ -f "$STUB/masked-$3" ]; then echo masked; exit 1; else echo generated; fi ;;
+  "--user is-enabled "*) if [ -f "$STUB/masked-$3" ]; then cat "$STUB/masked-$3"; exit 1; elif [ -f "$STUB/state-unknown" ]; then exit 1; else echo generated; fi ;;
 esac
 EOF
 cat >"$T/stub/podman" <<'EOF'
@@ -398,23 +398,46 @@ check "roll-all says to deploy the new prox-usage and exporter" has "$T/out" "de
 
 # The hubs are discovered from the quadlets, never listed in the script.
 discovered() { (discover_hubs >/dev/null 2>&1; echo "$HUBS"); }
+refuses() { ! (discover_hubs >/dev/null 2>&1); }
 reset_units
 check "roll-all discovers the hub quadlets, codex first and claude next" [ "$(discovered)" = "codex claude gemini" ]
-touch "$T/masked-proxd-gemini"
+echo masked >"$T/masked-proxd-gemini"
 check "roll-all leaves out a masked hub" [ "$(discovered)" = "codex claude" ]
-check "roll-all says a masked hub is not rolled" bash -c "$(declare -f discover_hubs log die); UNIT_DIR=$T/units ROLL_ORDER='codex claude'; discover_hubs | grep -qF 'proxd-gemini is masked; not a live hub, not rolled'"
+check "roll-all says a masked hub is not rolled" bash -c ". '$BIN/roll-all.sh'; discover_hubs 2>&1 | grep -qF 'proxd-gemini is masked; not a live hub, not rolled'"
+echo masked-runtime >"$T/masked-proxd-gemini"
+check "roll-all leaves out a runtime-masked hub" [ "$(discovered)" = "codex claude" ]
 rm -f "$T/masked-proxd-gemini"
+touch "$T/state-unknown"
+check "roll-all stops when it cannot read a unit's state" refuses
+rm -f "$T/state-unknown"
+sed -i 's/^Environment=CLIPROXY_INSTANCE_ID=gemini-primary/Environment="FOO=1" "CLIPROXY_INSTANCE_ID=gemini-primary"/' "$T/units/proxd-gemini.container"
+check "roll-all reads a quoted instance id among other assignments" [ "$(discovered)" = "codex claude gemini" ]
+check "roll-all reads the same quoted instance id for the subscription check" [ "$(INSTANCE=; unit_instance gemini)" = "gemini-primary" ]
+reset_units
+chmod 000 "$T/units/proxd-gemini.container"
+check "roll-all stops on a quadlet it cannot read" refuses
+chmod 644 "$T/units/proxd-gemini.container"
+printf '[Container]\nImage=localhost/catalog:1\n' >"$T/units/proxd-catalog.container"
+check "roll-all ignores a quadlet that declares no hub instance" [ "$(discovered)" = "codex claude gemini" ]
 cp "$T/units/proxd-codex.container" "$T/units/proxd-meta.container"
 sed -i 's/codex-primary/meta-primary/; s/proxd-codex/proxd-meta/' "$T/units/proxd-meta.container"
-printf '[Container]\nImage=localhost/catalog:1\n' >"$T/units/proxd-catalog.container"
-check "roll-all adds a new hub quadlet without a code change and ignores a non-hub quadlet" [ "$(discovered)" = "codex claude gemini meta" ]
+check "roll-all stops on a discovered hub roll.sh cannot roll, before any restart" refuses
+rm -f "$T/units/proxd-meta.container"
+cp "$T/units/proxd-codex.container" "$T/units/proxd-staging.container"
+check "roll-all refuses a staging quadlet as a live hub" refuses
 
 reset_units
 timers
-touch "$T/masked-proxd-gemini"
+echo masked >"$T/masked-proxd-gemini"
 "$BIN/roll-all.sh" --approved "$NEW" >"$T/out" 2>&1 && ok "roll-all succeeds with a masked hub" || { bad "roll-all succeeds with a masked hub"; cat "$T/out"; }
 check "roll-all with a masked hub restarts only the live hubs" [ "$(restarts)" = "restart proxd-codex restart proxd-claude " ]
 check "roll-all with a masked hub leaves its quadlet alone" [ "$(img gemini)" = "$OLD" ]
+
+reset_units
+timers
+ROLL_ORDER="claude codex" "$BIN/roll-all.sh" --approved "$NEW" >"$T/out" 2>&1 && ok "roll-all succeeds with a custom order" || { bad "roll-all succeeds with a custom order"; cat "$T/out"; }
+check "roll-all passes ROLL_ORDER to the unit" grep -qF -- "-E ROLL_ORDER=claude codex" "$T/systemd-run.args"
+check "roll-all rolls in the custom order" [ "$(restarts)" = "restart proxd-claude restart proxd-codex restart proxd-gemini " ]
 
 echo "$PASSES passed, $FAILS failed"
 [ "$FAILS" = 0 ]
