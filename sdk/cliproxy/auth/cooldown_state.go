@@ -74,6 +74,10 @@ type CooldownStateRecord struct {
 	// IndependentState beneath a credential_quota wrap. Read only, like
 	// IndependentState; never written.
 	IndependentNonQuotaCooldownUntil time.Time `json:"independent_non_quota_cooldown_until,omitempty"`
+	// Renewal persists the auth's renewal decision on its auth-level record
+	// (empty Model). Records carrying only Renewal have a zero NextRetryAfter
+	// and never restore a cooldown.
+	Renewal *RenewalStateRecord `json:"renewal,omitempty"`
 }
 
 // CooldownStateStore persists runtime cooldown state independently from auth tokens.
@@ -181,6 +185,17 @@ func readCooldownStateFile(ctx context.Context, path string) ([]CooldownStateRec
 
 // Save atomically writes one cooldown state file per auth and removes stale files.
 func (s *FileCooldownStateStore) Save(ctx context.Context, records []CooldownStateRecord) error {
+	return s.save(ctx, records, nil, true)
+}
+
+// SaveScoped writes the state files of owners only: each owner's file gets its
+// records, or is removed when it has none. Files of other credentials, such as
+// one that is not registered yet, are left untouched.
+func (s *FileCooldownStateStore) SaveScoped(ctx context.Context, records, owners []CooldownStateRecord) error {
+	return s.save(ctx, records, owners, false)
+}
+
+func (s *FileCooldownStateStore) save(ctx context.Context, records, owners []CooldownStateRecord, pruneAll bool) error {
 	if s == nil || s.dir == "" {
 		return nil
 	}
@@ -207,6 +222,9 @@ func (s *FileCooldownStateStore) Save(ctx context.Context, records []CooldownSta
 		groups[path] = append(groups[path], record)
 	}
 
+	if !pruneAll {
+		return s.saveScopedGroups(ctx, groups, owners)
+	}
 	if len(groups) == 0 {
 		return s.removeAllStateFiles(ctx)
 	}
@@ -222,6 +240,72 @@ func (s *FileCooldownStateStore) Save(ctx context.Context, records []CooldownSta
 		desired[filepath.Clean(path)] = struct{}{}
 	}
 	return s.removeStaleStateFiles(ctx, desired)
+}
+
+// saveScopedGroups rewrites the state files the owners map to. In each file
+// the owners' records are replaced by their new records, records of other
+// credentials sharing the file are kept, and the file is removed once empty.
+func (s *FileCooldownStateStore) saveScopedGroups(ctx context.Context, groups map[string][]CooldownStateRecord, owners []CooldownStateRecord) error {
+	owned := make(map[string]map[string]struct{})
+	own := func(path, authID string) {
+		if owned[path] == nil {
+			owned[path] = make(map[string]struct{})
+		}
+		owned[path][authID] = struct{}{}
+	}
+	for _, owner := range owners {
+		if path, errPath := s.statePath(owner); errPath == nil {
+			own(path, owner.AuthID)
+		}
+	}
+	for path, groupedRecords := range groups {
+		for _, record := range groupedRecords {
+			own(path, record.AuthID)
+		}
+	}
+	// One unreadable file is left as it is and reported after the others are saved.
+	var errUnreadable error
+	for path, authIDs := range owned {
+		// An unreadable file is not empty: it may hold another credential's records.
+		existing, errRead := readCooldownStateFile(ctx, path)
+		if errRead != nil {
+			if errUnreadable == nil {
+				errUnreadable = errRead
+			}
+			continue
+		}
+		merged := groups[path]
+		for _, record := range existing {
+			if _, replaced := authIDs[record.AuthID]; !replaced {
+				merged = append(merged, record)
+			}
+		}
+		if len(merged) == 0 {
+			if errRemove := os.Remove(path); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
+				return fmt.Errorf("remove cooldown state %s: %w", path, errRemove)
+			}
+			continue
+		}
+		if errSave := writeCooldownStateGroup(ctx, path, merged); errSave != nil {
+			return errSave
+		}
+	}
+	return errUnreadable
+}
+
+// LoadAuth reads the state file of the credential owner describes.
+func (s *FileCooldownStateStore) LoadAuth(ctx context.Context, owner CooldownStateRecord) ([]CooldownStateRecord, error) {
+	if s == nil || s.dir == "" {
+		return nil, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	path, errPath := s.statePath(owner)
+	if errPath != nil {
+		return nil, errPath
+	}
+	return readCooldownStateFile(ctx, path)
 }
 
 func writeCooldownStateGroup(ctx context.Context, path string, records []CooldownStateRecord) error {

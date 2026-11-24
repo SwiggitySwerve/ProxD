@@ -282,6 +282,9 @@ type Manager struct {
 	quotaObservationFlush quotaObservationFlushState
 	// quotaObservationNow overrides the throttle clock in tests.
 	quotaObservationNow func() time.Time
+	// removedCooldownOwners lists removed credentials whose state files the next
+	// cooldown state save deletes. Guarded by mu.
+	removedCooldownOwners []CooldownStateRecord
 }
 
 // NewManager constructs a manager with optional custom selector and hook.

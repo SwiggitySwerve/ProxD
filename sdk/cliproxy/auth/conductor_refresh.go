@@ -1264,8 +1264,10 @@ func (m *Manager) markRejectedAccessToken(id, failedAccessToken string) {
 	}
 	releaseMutation := m.lockAuthMutation(id)
 	defer releaseMutation()
+	marked := false
 	m.mu.Lock()
 	if current := m.auths[id]; current != nil && recordRejectedTokenOnAuth(current, failedAccessToken) {
+		marked = true
 		current.Generation++
 		current.UpdatedAt = time.Now()
 		m.auths[id] = current
@@ -1274,6 +1276,10 @@ func (m *Manager) markRejectedAccessToken(id, failedAccessToken string) {
 		}
 	}
 	m.mu.Unlock()
+	if marked {
+		releaseMutation()
+		m.persistCooldownStates(context.Background())
+	}
 }
 
 func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAccessToken string, registrationEpoch uint64) (*Auth, error) {
@@ -1500,6 +1506,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		shouldReschedule := false
 		isDisabled := false
 		shouldUnschedule := false
+		renewalChanged := false
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			if base != nil && (current.RegistrationEpoch != base.RegistrationEpoch || current.CredentialVersion != base.CredentialVersion || secretGrantChanged(base, current)) {
@@ -1510,6 +1517,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 				m.mu.Unlock()
 				return nil, err
 			}
+			renewalBefore := renewalStateRecordOf(current)
 			terminalRefresh := isTerminalRefreshError(current, err)
 			sanitizedRefreshErr := sanitizeRenewalError(current, err)
 			wasTerminalUnauthorized := hasUnauthorizedAuthFailure(current)
@@ -1527,14 +1535,18 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 					if current.RenewalEventAt.IsZero() {
 						current.RenewalEventAt = now
 					}
-					current.LastError = &Error{Code: "unauthorized", Message: sanitizedRefreshErr.Message, HTTPStatus: http.StatusUnauthorized}
+					current.LastError = markRefreshOriginated(&Error{Code: "unauthorized", Message: sanitizedRefreshErr.Message, HTTPStatus: http.StatusUnauthorized})
 					current.StatusMessage = "unauthorized (refresh token invalid)"
 				}
 				m.auths[id] = current
 				if m.scheduler != nil {
 					m.scheduler.upsertAuth(current.Clone())
 				}
+				renewalChanged := !renewalStateRecordEqual(renewalBefore, renewalStateRecordOf(current))
 				m.mu.Unlock()
+				if renewalChanged {
+					m.persistCooldownStates(context.Background())
+				}
 				m.queueRefreshUnschedule(id)
 				return nil, err
 			}
@@ -1613,7 +1625,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 				current.NextRefreshAfter = time.Time{}
 				current.NextRetryAfter = time.Time{}
 				current.RefreshFailures = 0
-				current.LastError = &Error{Code: "unauthorized", Message: sanitizedRefreshErr.Message, HTTPStatus: http.StatusUnauthorized}
+				current.LastError = markRefreshOriginated(&Error{Code: "unauthorized", Message: sanitizedRefreshErr.Message, HTTPStatus: http.StatusUnauthorized})
 				if unauthorized && !invalidGrant {
 					current.StatusMessage = "unauthorized"
 				} else {
@@ -1693,8 +1705,12 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 			if m.scheduler != nil {
 				m.scheduler.upsertAuth(current.Clone())
 			}
+			renewalChanged = !renewalStateRecordEqual(renewalBefore, renewalStateRecordOf(current))
 		}
 		m.mu.Unlock()
+		if renewalChanged {
+			m.persistCooldownStates(context.Background())
+		}
 		if shouldReschedule {
 			m.queueRefreshReschedule(id)
 		} else if shouldUnschedule {

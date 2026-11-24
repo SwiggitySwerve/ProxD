@@ -1258,6 +1258,9 @@ func credentialAvailabilityBlock(ctx context.Context, auth *Auth, model string, 
 	if hasUnauthorizedAuthFailure(auth) {
 		return true, blockReasonOther, time.Time{}
 	}
+	if authAccessTokenForRequest(ctx, auth, clientHeaders...) == "" && authCannotObtainAccessToken(auth) {
+		return true, blockReasonOther, time.Time{}
+	}
 	if exp, ok := auth.AccessTokenExpirationTimeForRequest(ctx, clientHeaders...); ok && !exp.IsZero() && !exp.After(now) {
 		return true, blockReasonOther, time.Time{}
 	}

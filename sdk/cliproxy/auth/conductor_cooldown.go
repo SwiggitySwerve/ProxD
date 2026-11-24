@@ -323,7 +323,8 @@ func (m *Manager) clearDisabledCooldownStates(cfg *internalconfig.Config) bool {
 	return len(snapshots) > 0
 }
 
-// RestoreCooldownStates restores unexpired persisted cooldown records into registered auths.
+// RestoreCooldownStates restores unexpired persisted cooldown records, and the
+// persisted renewal state, into registered auths.
 func (m *Manager) RestoreCooldownStates(ctx context.Context) error {
 	if m == nil {
 		return nil
@@ -333,6 +334,7 @@ func (m *Manager) RestoreCooldownStates(ctx context.Context) error {
 	}
 	m.mu.RLock()
 	store := m.cooldownStore
+	renewalBaselines := m.renewalRestoreBaselinesLocked()
 	m.mu.RUnlock()
 	if store == nil {
 		return nil
@@ -350,6 +352,15 @@ func (m *Manager) RestoreCooldownStates(ctx context.Context) error {
 	snapshotsByID := make(map[string]*Auth)
 
 	m.mu.Lock()
+	if m.cooldownStore == store {
+		for _, record := range records {
+			if m.restoreRenewalStateLocked(record, renewalBaselines) {
+				if auth := m.auths[strings.TrimSpace(record.AuthID)]; auth != nil {
+					snapshotsByID[auth.ID] = auth.Clone()
+				}
+			}
+		}
+	}
 	for _, record := range records {
 		if m.restoreQuotaObservationLocked(record) {
 			if auth := m.auths[strings.TrimSpace(record.AuthID)]; auth != nil {
@@ -1147,23 +1158,46 @@ func (m *Manager) persistCooldownStatesToLocked(ctx context.Context, store Coold
 	if errContext := ctx.Err(); errContext != nil {
 		return false
 	}
-	records := m.cooldownStateRecordsSnapshot()
-	if errSave := store.Save(ctx, records); errSave != nil {
+	records, owners, removed := m.cooldownStateSaveSnapshot()
+	var errSave error
+	if scoped, ok := store.(cooldownStateScopedStore); ok {
+		errSave = scoped.SaveScoped(ctx, records, owners)
+	} else {
+		errSave = store.Save(ctx, records)
+	}
+	if errSave != nil {
 		logEntryWithRequestID(ctx).Warnf("failed to persist cooldown state: %v", errSave)
 		return false
 	}
 	m.noteQuotaObservationsSaved()
+	m.mu.Lock()
+	m.removedCooldownOwners = m.removedCooldownOwners[removed:]
+	m.mu.Unlock()
 	return ctx.Err() == nil
 }
 
 func (m *Manager) cooldownStateRecordsSnapshot() []CooldownStateRecord {
+	records, _, _ := m.cooldownStateSaveSnapshot()
+	return records
+}
+
+// cooldownStateSaveSnapshot returns the records to save, the credentials whose
+// state files the save owns (registered ones and those removed since the last
+// save), and how many queued removals the save covers.
+func (m *Manager) cooldownStateSaveSnapshot() ([]CooldownStateRecord, []CooldownStateRecord, int) {
 	now := time.Now()
 	records := make([]CooldownStateRecord, 0)
 
 	m.mu.RLock()
+	owners := make([]CooldownStateRecord, 0, len(m.auths)+len(m.removedCooldownOwners))
 	for _, auth := range m.auths {
-		records = append(records, attachQuotaObservationsLocked(auth, m.cooldownStateRecordsForAuthLocked(auth, now))...)
+		records = append(records, attachRenewalStateLocked(auth, attachQuotaObservationsLocked(auth, m.cooldownStateRecordsForAuthLocked(auth, now)))...)
+		if auth != nil {
+			owners = append(owners, CooldownStateRecord{AuthID: auth.ID, AuthFile: cooldownAuthFile(auth)})
+		}
 	}
+	owners = append(owners, m.removedCooldownOwners...)
+	removed := len(m.removedCooldownOwners)
 	m.mu.RUnlock()
 
 	sort.Slice(records, func(i, j int) bool {
@@ -1175,7 +1209,7 @@ func (m *Manager) cooldownStateRecordsSnapshot() []CooldownStateRecord {
 		}
 		return records[i].Model < records[j].Model
 	})
-	return records
+	return records, owners, removed
 }
 
 func (m *Manager) cooldownStateRecordsForAuthLocked(auth *Auth, now time.Time) []CooldownStateRecord {
@@ -1282,7 +1316,7 @@ func authCooldownStateRecord(auth *Auth, now time.Time) (CooldownStateRecord, bo
 	if auth.nonQuotaCooldownUntil.After(now) {
 		nonQuotaUntil = auth.nonQuotaCooldownUntil
 	}
-	return CooldownStateRecord{
+	return withoutRefreshDiagnostics(auth, CooldownStateRecord{
 		Provider:                    strings.TrimSpace(auth.Provider),
 		AuthID:                      auth.ID,
 		AuthFile:                    cooldownAuthFile(auth),
@@ -1299,7 +1333,7 @@ func authCooldownStateRecord(auth *Auth, now time.Time) (CooldownStateRecord, bo
 		ForceCooldownEvaluated:      true,
 		CredentialRetryAfter:        credentialRetryAfter,
 		NonQuotaCooldownUntil:       nonQuotaUntil,
-	}, true
+	}), true
 }
 
 func modelCooldownStateRecord(auth *Auth, model string, state *ModelState, now time.Time) (CooldownStateRecord, bool) {
@@ -1445,6 +1479,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	now := time.Now()
 	// A 401 condemns the access token, except one a -and-cooldown rule matched: that only cools the credential.
 	rejectsToken := !result.Success && (result.Error == nil || result.Error.Code != ErrorCodeForceCooldown) && !shouldSkipCredentialCooldown(result.Error) && (statusCodeFromResult(result.Error) == http.StatusUnauthorized || isUnauthorizedError(result.Error))
+	renewalChanged := false
 
 	releaseMutation := m.lockAuthMutation(result.AuthID)
 	defer releaseMutation()
@@ -1456,10 +1491,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				if recordRejectedTokenOnAuth(auth, result.AccessToken) {
 					auth.Generation++
 					auth.UpdatedAt = now
+					renewalChanged = true
 				}
 			}
 			m.mu.Unlock()
 			releaseMutation()
+			if renewalChanged {
+				m.persistCooldownStates(context.Background())
+			}
 			m.hook.OnResult(ctx, result)
 			m.publishErrorEvent(result, nil)
 			return
@@ -1912,7 +1951,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			if tokenToReject == "" {
 				tokenToReject = authAccessTokenForRequest(ctx, auth, result.Options.Headers)
 			}
-			_ = recordRejectedTokenOnAuth(auth, tokenToReject)
+			renewalChanged = recordRejectedTokenOnAuth(auth, tokenToReject)
 		}
 		if wasTerminalUnauthorized {
 			auth.Unavailable = true
@@ -1972,7 +2011,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		}
 		m.scheduler.upsertAuthResult(authSnapshot, targetModels, credentialScopedResult)
 	}
-	if authSnapshot != nil && cooldownStateChanged {
+	if authSnapshot != nil && (cooldownStateChanged || renewalChanged) {
 		m.persistCooldownStates(context.Background())
 	} else if authSnapshot != nil && observationChanged {
 		m.observeQuotaChange()
@@ -3284,7 +3323,7 @@ func refreshErrorFromError(err error) *Error {
 		authErr.Code = "unauthorized"
 		authErr.Retryable = false
 	}
-	return authErr
+	return markRefreshOriginated(authErr)
 }
 
 func retryAfterFromError(err error) *time.Duration {

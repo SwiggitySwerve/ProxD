@@ -20,9 +20,9 @@ func refreshAccessError(auth *Auth, message string, accessTokenRejected, wasTerm
 			// A diagnostic 401 must not turn this recovery state into access rejection.
 			outcome.HTTPStatus = http.StatusServiceUnavailable
 		}
-		return outcome
+		return markRefreshOriginated(outcome)
 	}
-	return &Error{Code: "unauthorized", Message: message, HTTPStatus: http.StatusUnauthorized}
+	return markRefreshOriginated(&Error{Code: "unauthorized", Message: message, HTTPStatus: http.StatusUnauthorized})
 }
 
 // codexRefreshMissingAccessForRequest keeps model-level availability from

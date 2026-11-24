@@ -202,6 +202,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		auth.AdoptedGrantHash = AuthGrantFingerprint(auth)
 	}
 	auth.UpdatedAt = now
+	m.restoreRenewalStateFromStore(ctx, auth)
 	cooldownStateChanged := normalizeModelStates(auth)
 	seedInitialForceCooldownDeadlines(auth)
 	if auth.Disabled || auth.Status == StatusDisabled {
@@ -245,6 +246,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 			updateAggregatedAvailability(auth, now)
 		}
 	}
+	cooldownStateChanged = !renewalStateRecordEqual(renewalStateRecordOf(m.auths[auth.ID]), renewalStateRecordOf(auth)) || cooldownStateChanged
 	auth.ClearFileSnapshot()
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
@@ -745,6 +747,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	if existing.Generation >= auth.Generation {
 		auth.Generation = existing.Generation + 1
 	}
+	renewalChanged := !renewalStateRecordEqual(renewalStateRecordOf(m.auths[auth.ID]), renewalStateRecordOf(auth))
 	auth.ClearFileSnapshot()
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
@@ -765,7 +768,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	if shouldForgetWeighted {
 		m.forgetWeightedAuthUpTo(authClone.ID, forgetEpoch, forgetGen)
 	}
-	return auth.Clone(), true, cooldownStateChanged, nil
+	return auth.Clone(), true, cooldownStateChanged || renewalChanged, nil
 }
 
 func equalErrorPtr(a, b *Error) bool {
@@ -814,6 +817,10 @@ func (m *Manager) RemoveIf(ctx context.Context, id string, predicate func(*Auth)
 	if existing == nil {
 		m.mu.Unlock()
 		return false
+	}
+	if m.cooldownStore != nil {
+		// The next save removes this credential's state file.
+		m.removedCooldownOwners = append(m.removedCooldownOwners, CooldownStateRecord{AuthID: id, AuthFile: cooldownAuthFile(existing)})
 	}
 	provider := strings.TrimSpace(existing.Provider)
 	delete(m.auths, id)
