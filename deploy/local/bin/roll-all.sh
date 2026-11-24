@@ -158,7 +158,8 @@ quadlet_instance() { # quadlet_instance <unit-file>; empty when the quadlet decl
   local plain any
   # Quadlet joins a line ending in a backslash to the lines after it (skipping comments), so
   # no line of a hub quadlet can be read on its own then. Ours never continue a line.
-  if grep -q 'CLIPROXY_INSTANCE_ID' "$1" && grep -q '\\$' "$1"; then
+  # Quadlet trims trailing whitespace (and a CR) before it looks for the backslash.
+  if grep -q 'CLIPROXY_INSTANCE_ID' "$1" && grep -qE '\\[[:space:]]*$' "$1"; then
     die "$1 continues a line with a backslash; write each setting on one line"
   fi
   plain=$(sed -n 's/^Environment=CLIPROXY_INSTANCE_ID=\([A-Za-z0-9][A-Za-z0-9._-]*\)$/\1/p' "$1" | head -n1)
