@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # roll-all.sh [--dry-run] --approved <image-tag>
 #
-# Rolls the three live hubs (codex, claude, gemini) to <image-tag> one at a time, through
-# roll.sh, with every condition the live host needs built in:
+# Rolls every live hub to <image-tag> one at a time, through roll.sh, with every condition
+# the live host needs built in. The hubs are discovered, never listed: each proxd-*.container
+# quadlet that declares Environment=CLIPROXY_INSTANCE_ID= and whose unit is not masked (a
+# hub taken out of service keeps its quadlet but is masked, as gemini was on 2026-11-22).
+#
 #
 #   - It runs inside its own `systemd-run --user` unit (idle IO class, nice 10). Started
 #     from a shell, it re-executes itself there and follows the unit's log file, so a
@@ -36,7 +39,11 @@ ROLL=$BIN/roll.sh
 UNIT_DIR=${LIVE_UNIT_DIR:-$HOME/.config/containers/systemd}
 DATA_ROOT=${LIVE_DATA_ROOT:-$HOME/.local/share/proxd}
 EXPORTER_URL=${EXPORTER_URL:-http://127.0.0.1:9787/metrics}
-HUBS="codex claude gemini"
+HUBS=""  # discovered by read_quadlets
+# Order only, never membership: these discovered hubs roll first, in this order, and any
+# other discovered hub follows alphabetically. codex goes first so the image proves itself
+# before proxd-claude, which carries the operator's own Claude sessions, restarts.
+ROLL_ORDER=${ROLL_ORDER:-codex claude}
 # UTC; 04:20 is prox-usage-nightly.
 NIGHTLY_WINDOWS="01:00-04:00 04:20-07:00 12:20-13:00"
 WINDOW_MARGIN_MIN=${WINDOW_MARGIN_MIN:-20}
@@ -47,7 +54,7 @@ QUIET_AFTER=${QUIET_AFTER:-60}
 QUIET_WAIT=${QUIET_WAIT:-900}
 SUBSCRIBE_TIMEOUT=${SUBSCRIBE_TIMEOUT:-180}
 # Settings the unit needs from this environment (systemd-run does not pass it on).
-PASS_ENV="PATH LIVE_UNIT_DIR LIVE_DATA_ROOT EXPORTER_URL WINDOW_MARGIN_MIN QUIET_TIMERS QUIET_BEFORE QUIET_AFTER QUIET_WAIT SUBSCRIBE_TIMEOUT ROLL_ALL_NOW"
+PASS_ENV="PATH LIVE_UNIT_DIR LIVE_DATA_ROOT EXPORTER_URL WINDOW_MARGIN_MIN QUIET_TIMERS QUIET_BEFORE QUIET_AFTER QUIET_WAIT SUBSCRIBE_TIMEOUT ROLL_ALL_NOW ROLL_ORDER"
 
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 die() { log "error: $*" >&2; exit 1; }
@@ -143,11 +150,66 @@ wait_subscribed() { # wait_subscribed <instance> <before> <before_boot>
 
 unit_path() { echo "$UNIT_DIR/proxd-$1.container"; }
 unit_image() { sed -n 's/^Image=//p' "$(unit_path "$1")" | head -n1; }
-unit_instance() { sed -n 's/^Environment=CLIPROXY_INSTANCE_ID=//p' "$(unit_path "$1")" | head -n1; }
+# The hub's instance id. Our quadlets declare it on its own line as
+# Environment=CLIPROXY_INSTANCE_ID=<id>, the only form read here (as before discovery).
+# Any other mention of it (quoted, among other assignments) stops the run rather than
+# being guessed at, so discovery and the subscription check can never disagree.
+quadlet_instance() { # quadlet_instance <unit-file>; empty when the quadlet declares none
+  local plain any
+  # Quadlet joins a line ending in a backslash to the lines after it (skipping comments), so
+  # no line of a hub quadlet can be read on its own then. Ours never continue a line.
+  # Quadlet trims trailing whitespace (and a CR) before it looks for the backslash.
+  if grep -q 'CLIPROXY_INSTANCE_ID' "$1" && grep -qE '\\[[:space:]]*$' "$1"; then
+    die "$1 continues a line with a backslash; write each setting on one line"
+  fi
+  plain=$(sed -n 's/^Environment=CLIPROXY_INSTANCE_ID=\([A-Za-z0-9][A-Za-z0-9._-]*\)$/\1/p' "$1" | head -n1)
+  any=$(grep -c 'CLIPROXY_INSTANCE_ID' "$1" || true)
+  if [ "$any" != 0 ] && { [ -z "$plain" ] || [ "$any" != 1 ]; }; then
+    die "$1 must declare its hub as one line Environment=CLIPROXY_INSTANCE_ID=<id>"
+  fi
+  printf '%s\n' "$plain"
+}
+unit_instance() { quadlet_instance "$(unit_path "$1")"; }
 
 declare -A PREV INSTANCE
+discover_hubs() {
+  local unit hub state instance found=" " ordered=""
+  for unit in "$UNIT_DIR"/proxd-*.container; do
+    [ -e "$unit" ] || continue
+    [ -r "$unit" ] || die "cannot read $unit"
+    # quadlet_instance runs in a subshell here: its die only ends that, so stop on its status.
+    instance=$(quadlet_instance "$unit") || exit 1
+    [ -n "$instance" ] || continue
+    hub=${unit##*/proxd-}
+    hub=${hub%.container}
+    [ "$hub" != staging ] || die "$unit declares a hub instance, but staging is not a live hub"
+    state=$(systemctl --user is-enabled "proxd-$hub" 2>/dev/null || true)
+    case $state in
+      masked | masked-runtime)
+        log "proxd-$hub is $state; not a live hub, not rolled"
+        continue
+        ;;
+      "") die "cannot read the unit state of proxd-$hub (systemctl --user is-enabled)" ;;
+    esac
+    found="$found$hub "
+  done
+  for hub in $ROLL_ORDER; do
+    [[ $found == *" $hub "* ]] && ordered="${ordered:+$ordered }$hub" && found=${found/ $hub / }
+  done
+  for hub in $found; do ordered="${ordered:+$ordered }$hub"; done
+  HUBS=$ordered
+  [ -n "$HUBS" ] || die "no hub quadlets (proxd-*.container with CLIPROXY_INSTANCE_ID) in $UNIT_DIR"
+  # Every hub must be one roll.sh can roll, checked before any restart, so a run never
+  # rolls some hubs and then stops on one it cannot.
+  for hub in $HUBS; do
+    "$ROLL" --dry-run "$hub" "${IMAGE:-localhost/proxd:check}" >/dev/null 2>&1 ||
+      die "discovered hub $hub (proxd-$hub.container) is not a target roll.sh can roll"
+  done
+}
+
 read_quadlets() {
   local hub
+  discover_hubs
   for hub in $HUBS; do
     [ -f "$(unit_path "$hub")" ] || die "unit file $(unit_path "$hub") not found"
     PREV[$hub]=$(unit_image "$hub")
